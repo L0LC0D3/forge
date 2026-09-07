@@ -24,6 +24,12 @@
 #  endif
 #endif
 
+#if defined(_MSC_VER) && !defined(__cplusplus)
+#  define FORGE_INLINE static __inline
+#else
+#  define FORGE_INLINE static inline
+#endif
+
 enum {
     FORGE_OS_WINDOWS,
     FORGE_OS_LINUX,
@@ -61,7 +67,7 @@ enum {
     FORGE_KIND_IMPORT
 };
 
-static inline int forge_os(void)
+FORGE_INLINE int forge_os(void)
 {
 #if defined(_WIN32)
     return FORGE_OS_WINDOWS;
@@ -76,7 +82,7 @@ static inline int forge_os(void)
 #endif
 }
 
-static inline int forge_arch(void)
+FORGE_INLINE int forge_arch(void)
 {
 #if defined(__aarch64__) || defined(_M_ARM64)
     return FORGE_ARCH_AARCH64;
@@ -91,7 +97,7 @@ static inline int forge_arch(void)
 #endif
 }
 
-static inline int forge_cc(void)
+FORGE_INLINE int forge_cc(void)
 {
 #if defined(__clang__) && defined(_MSC_VER)
     return FORGE_CC_CLANGCL;
@@ -108,7 +114,7 @@ static inline int forge_cc(void)
 #endif
 }
 
-static inline int forge_dialect(void)
+FORGE_INLINE int forge_dialect(void)
 {
     int cc = forge_cc();
     if (cc == FORGE_CC_MSVC || cc == FORGE_CC_CLANGCL)
@@ -239,14 +245,25 @@ void forge__set_jobs(int n);
 #  define forge__pclose _pclose
 #else
 #  include <sys/types.h>
+#  include <sys/time.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
 #  include <dirent.h>
-#  include <sys/ioctl.h>
 #  include <fcntl.h>
+#  include <sys/ioctl.h>
+#  include <termios.h>
 #  include <sys/select.h>
 #  define forge__popen  popen
 #  define forge__pclose pclose
+#  ifndef EWOULDBLOCK
+#    define EWOULDBLOCK EAGAIN
+#  endif
+#  ifndef S_ISREG
+#    define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#  endif
+#  ifndef S_ISDIR
+#    define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#  endif
 #endif
 
 static ForgeTarget  forge__def;
@@ -278,6 +295,33 @@ static void forge__oom(void)
     exit(1);
 }
 
+static int forge__vsnprintf(char *s, size_t n, const char *fmt, va_list ap)
+{
+#if defined(_MSC_VER) && _MSC_VER < 1900
+    int r;
+    if (!s || n == 0)
+        return _vscprintf(fmt, ap);
+    r = _vsnprintf(s, n, fmt, ap);
+    if (n)
+        s[n - 1] = '\0';
+    if (r >= 0 && (size_t)r < n)
+        return r;
+    return _vscprintf(fmt, ap);
+#else
+    return vsnprintf(s, n, fmt, ap);
+#endif
+}
+
+static int forge__snprintf(char *s, size_t n, const char *fmt, ...)
+{
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = forge__vsnprintf(s, n, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
 static char *forge__dup(const char *s)
 {
     size_t n = strlen(s) + 1;
@@ -290,21 +334,31 @@ static char *forge__dup(const char *s)
 
 static char *forge__fmt(const char *fmt, ...)
 {
-    va_list ap, aq;
+    va_list ap;
     int n;
+    size_t cap = 256;
     char *s;
-    va_start(ap, fmt);
-    va_copy(aq, ap);
-    n = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
-    if (n < 0)
-        n = 256;
-    s = (char *)malloc((size_t)n + 1);
-    if (!s)
-        forge__oom();
-    vsnprintf(s, (size_t)n + 1, fmt, aq);
-    va_end(aq);
-    return s;
+    for (;;) {
+        s = (char *)malloc(cap);
+        if (!s)
+            forge__oom();
+        va_start(ap, fmt);
+        n = forge__vsnprintf(s, cap, fmt, ap);
+        va_end(ap);
+        if (n < 0) {
+            free(s);
+            if (cap >= (size_t)1 << 20)
+                forge__oom();
+            cap *= 2;
+            continue;
+        }
+        if ((size_t)n < cap)
+            return s;
+        free(s);
+        cap = (size_t)n + 1;
+        if (cap < (size_t)n)
+            forge__oom();
+    }
 }
 
 static void forge__add1(ForgeStrs *s, const char *x)
@@ -378,8 +432,13 @@ static int forge__nproc(void)
         return 1;
     return (int)si.dwNumberOfProcessors;
 #else
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n < 1 ? 1 : (int)n;
+    {
+        long n = 1;
+#ifdef _SC_NPROCESSORS_ONLN
+        n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+        return n < 1 ? 1 : (int)n;
+    }
 #endif
 }
 
@@ -473,6 +532,18 @@ static const char *forge__stdflag(const char *std)
         memcpy(buf, "c++20", 6);
     else if (strcmp(buf, "c++23") == 0 || strcmp(buf, "c++2b") == 0)
         memcpy(buf, "c++latest", 10);
+#if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1928
+    {
+        int cxx = buf[0] == 'c' && buf[1] == '+' && buf[2] == '+';
+#  if _MSC_VER < 1900
+        (void)cxx;
+        return NULL;
+#  else
+        if (!cxx)
+            return NULL;
+#  endif
+    }
+#endif
     return forge__fmt("/std:%s", buf);
 }
 
@@ -845,7 +916,7 @@ static int forge__dopen(forge__dir *d, const char *path)
 #ifdef _WIN32
     {
         char pat[1024];
-        snprintf(pat, sizeof(pat), "%s\\*", path);
+        forge__snprintf(pat, sizeof(pat), "%s\\*", path);
         d->h = FindFirstFileA(pat, &d->fd);
         d->first = 1;
         return d->h != INVALID_HANDLE_VALUE;
@@ -1263,9 +1334,13 @@ static int forge__cols(void)
             return w;
     }
 #else
-    struct winsize ws;
-    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20)
-        return ws.ws_col;
+#ifdef TIOCGWINSZ
+    {
+        struct winsize ws;
+        if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20)
+            return ws.ws_col;
+    }
+#endif
 #endif
     return 80;
 }
@@ -1377,10 +1452,10 @@ static void forge__bar_draw(void)
     bar[inner] = '\0';
     forge__bar_names(names, (int)sizeof(names));
     if (names[0])
-        n = snprintf(line, sizeof(line), "  [%s] %d/%d    %s",
+        n = forge__snprintf(line, sizeof(line), "  [%s] %d/%d    %s",
                 bar, cur, forge__bar_tot, names);
     else
-        n = snprintf(line, sizeof(line), "  [%s] %d/%d",
+        n = forge__snprintf(line, sizeof(line), "  [%s] %d/%d",
                 bar, cur, forge__bar_tot);
     if (n < 0)
         n = 0;
@@ -1636,7 +1711,7 @@ static int forge__spawn(ForgeStrs *cmd, ForgeSlot *s, int capture)
             }
             SetHandleInformation(s->rd, HANDLE_FLAG_INHERIT, 0);
             si.dwFlags |= STARTF_USESTDHANDLES;
-            si.hStdInput = INVALID_HANDLE_VALUE;
+            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
             si.hStdOutput = wr;
             si.hStdError = wr;
         }
@@ -1816,6 +1891,10 @@ static int forge__waitany(ForgeSlot *slots, int n, int *idx)
         for (i = 0; i < n; i++) {
             if (!slots[i].used || slots[i].fd < 0)
                 continue;
+#ifdef FD_SETSIZE
+            if (slots[i].fd >= FD_SETSIZE)
+                continue;
+#endif
             FD_SET(slots[i].fd, &rf);
             if (slots[i].fd > maxfd)
                 maxfd = slots[i].fd;
@@ -1913,7 +1992,7 @@ void forge__pkg(const char *name)
     int st;
     char *p, *start;
 
-    snprintf(cmd, sizeof(cmd), "pkg-config --cflags --libs %s", name);
+    forge__snprintf(cmd, sizeof(cmd), "pkg-config --cflags --libs %s", name);
     f = forge__popen(cmd, "r");
     if (!f) {
 #ifndef _WIN32
@@ -2027,14 +2106,19 @@ static void forge__emit_compile(ForgeStrs *cmd, ForgeTarget *t)
     }
     if (t->debug)
         forge__add1(cmd, msvc ? "/Zi" : "-g");
+#if defined(_MSC_VER) && _MSC_VER >= 1800
     if (msvc && t->debug && forge__njobs > 1)
         forge__add1(cmd, "/FS");
+#endif
     if (t->warn) {
         if (msvc) {
             forge__add1(cmd, "/W4");
         } else {
             forge__add1(cmd, "-Wall");
+#if !defined(__TINYC__) && (!defined(__GNUC__) || defined(__clang__) || \
+     __GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 4))
             forge__add1(cmd, "-Wextra");
+#endif
         }
     }
     if ((t->pic || t->kind == FORGE_KIND_DLL) && !msvc)
@@ -2391,6 +2475,9 @@ static int forge__sched(ForgeJob *jobs, int nj)
 #ifdef _WIN32
     if (nslot > 64)
         nslot = 64;
+#elif defined(FD_SETSIZE)
+    if (nslot > FD_SETSIZE / 2)
+        nslot = FD_SETSIZE / 2;
 #endif
     if (nslot > nj)
         nslot = nj;
@@ -2737,19 +2824,114 @@ static int forge__ends_iexe(const char *s)
             (e[3] == 'e' || e[3] == 'E'));
 }
 
+static void forge__rm_quiet(const char *path)
+{
+#ifdef _WIN32
+    SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+    DeleteFileA(path);
+#else
+    unlink(path);
+#endif
+}
+
+static int forge__mv(const char *from, const char *to)
+{
+#ifdef _WIN32
+    forge__rm_quiet(to);
+    if (MoveFileA(from, to))
+        return 1;
+    forge__errf("rename `%s` -> `%s` failed (%lu)",
+            from, to, (unsigned long)GetLastError());
+    return 0;
+#else
+    if (rename(from, to) == 0)
+        return 1;
+    forge__errf("rename `%s` -> `%s`: %s", from, to, strerror(errno));
+    return 0;
+#endif
+}
+
+static const char *forge__selfbin(const char *argv0)
+{
+#ifdef _WIN32
+    static char self[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, self, MAX_PATH);
+    if (n > 0 && n < MAX_PATH)
+        return self;
+    if (!forge__ends_iexe(argv0))
+        return forge__fmt("%s.exe", argv0);
+#endif
+    return argv0;
+}
+
+static int forge__cc_self(const char *src, const char *out)
+{
+    ForgeStrs cmd = {0};
+    forge__add1(&cmd, forge__ccbin(0));
+    if (forge__msvc()) {
+        forge__add1(&cmd, "/nologo");
+        forge__add1(&cmd, forge__fmt("/Fe%s", out));
+        forge__add1(&cmd, src);
+    } else {
+        forge__add1(&cmd, "-o");
+        forge__add1(&cmd, out);
+        forge__add1(&cmd, src);
+    }
+    if (forge__verbose)
+        forge__printcmd(&cmd);
+    return forge__exec(&cmd, 1);
+}
+
+static int forge__reentered(void)
+{
+#ifdef _WIN32
+    char b[2];
+    return GetEnvironmentVariableA("FORGE_REBUILT", b, 2) > 0;
+#else
+    return getenv("FORGE_REBUILT") != NULL;
+#endif
+}
+
+static void forge__mark(void)
+{
+#ifdef _WIN32
+    SetEnvironmentVariableA("FORGE_REBUILT", "1");
+#else
+    static char e[] = "FORGE_REBUILT=1";
+    putenv(e);
+#endif
+}
+
+static void forge__apply(int argc, char **argv, const char *bin)
+{
+    ForgeStrs cmd = {0};
+    int i, ok;
+#ifndef _WIN32
+    execv(bin, (char * const *)argv);
+    forge__errf("exec `%s`: %s", bin, strerror(errno));
+#endif
+    forge__add1(&cmd, bin);
+    for (i = 1; i < argc; i++)
+        forge__add1(&cmd, argv[i]);
+    ok = forge__exec(&cmd, 0);
+    exit(ok ? 0 : 1);
+}
+
 void forge__rebuild(int argc, char **argv, const char *src, ...)
 {
-    const char *bin = argv[0];
-    ForgeStrs srcs = {0}, cmd = {0};
+    const char *bin = forge__selfbin(argv[0]);
+    char *oldp = forge__fmt("%s.old", bin);
+    char *newp = forge__fmt("%s.new", bin);
+    ForgeStrs srcs = {0};
     va_list ap;
     const char *extra;
     int need, i;
-    char *oldp;
 
-#ifdef _WIN32
-    if (!forge__ends_iexe(bin))
-        bin = forge__fmt("%s.exe", bin);
-#endif
+    forge__rm_quiet(oldp);
+    forge__rm_quiet(newp);
+    if (forge__reentered())
+        return;
+
     forge__add1(&srcs, src);
     va_start(ap, src);
     while ((extra = va_arg(ap, const char *)) != NULL)
@@ -2767,49 +2949,23 @@ void forge__rebuild(int argc, char **argv, const char *src, ...)
             forge__verbose = 1;
     }
 
-    oldp = forge__fmt("%s.old", bin);
-#ifdef _WIN32
-    DeleteFileA(oldp);
-    if (!MoveFileA(bin, oldp)) {
-        forge__errf("rename `%s` -> `%s` failed (%lu)",
-                bin, oldp, (unsigned long)GetLastError());
-        exit(1);
-    }
-#else
-    if (rename(bin, oldp) != 0) {
-        forge__errf("rename `%s` -> `%s`: %s", bin, oldp, strerror(errno));
-        exit(1);
-    }
-#endif
-
     forge__say("RECIPE", src);
-    forge__add1(&cmd, forge__ccbin(0));
-    if (forge__msvc()) {
-        forge__add1(&cmd, "/nologo");
-        forge__add1(&cmd, forge__fmt("/Fe%s", bin));
-        forge__add1(&cmd, src);
-    } else {
-        forge__add1(&cmd, "-o");
-        forge__add1(&cmd, bin);
-        forge__add1(&cmd, src);
-    }
-    if (forge__verbose)
-        forge__printcmd(&cmd);
-    if (!forge__exec(&cmd, 1)) {
-#ifdef _WIN32
-        MoveFileA(oldp, (char *)bin);
-#else
-        rename(oldp, bin);
-#endif
+    if (!forge__cc_self(src, newp)) {
+        forge__rm_quiet(newp);
         exit(1);
     }
-
-    cmd.count = 0;
-    forge__add1(&cmd, bin);
-    for (i = 1; i < argc; i++)
-        forge__add1(&cmd, argv[i]);
-    i = forge__exec(&cmd, 0);
-    exit(i ? 0 : 1);
+    if (!forge__mv(bin, oldp)) {
+        forge__rm_quiet(newp);
+        exit(1);
+    }
+    if (!forge__mv(newp, bin)) {
+        forge__mv(oldp, bin);
+        forge__rm_quiet(newp);
+        exit(1);
+    }
+    forge__rm_quiet(oldp);
+    forge__mark();
+    forge__apply(argc, argv, bin);
 }
 
 #endif /* FORGE__IMPL */
