@@ -1,0 +1,11 @@
+build/
+*.exe
+*.old
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+mock-projects/*/build
