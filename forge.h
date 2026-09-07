@@ -257,7 +257,7 @@ static int          forge__bar_done;
 static const char  *forge__bar_name;
 
 static void forge__errf(const char *fmt, ...);
-static int  forge__exec(ForgeStrs *cmd);
+static int  forge__exec(ForgeStrs *cmd, int capture);
 
 static void forge__oom(void)
 {
@@ -397,6 +397,39 @@ static int forge__msvc(void)
     return forge_dialect() == FORGE_DIALECT_MSVC;
 }
 
+static const char *forge__stdflag(const char *std)
+{
+    char buf[32];
+    const char *s = std;
+    size_t n;
+    if (!forge__msvc())
+        return forge__fmt("-std=%s", std);
+    if (forge_cc() == FORGE_CC_CLANGCL)
+        return forge__fmt("/std:%s", std);
+    if (s[0] == 'g' && s[1] == 'n' && s[2] == 'u')
+        s += 3;
+    n = strlen(s);
+    if (n >= sizeof(buf))
+        return forge__fmt("/std:%s", s);
+    memcpy(buf, s, n + 1);
+    if (strcmp(buf, "c89") == 0 || strcmp(buf, "c90") == 0)
+        return NULL;
+    if (strcmp(buf, "c99") == 0)
+        memcpy(buf, "c11", 4);
+    else if (strcmp(buf, "c18") == 0)
+        memcpy(buf, "c17", 4);
+    else if (strcmp(buf, "c23") == 0 || strcmp(buf, "c2x") == 0)
+        memcpy(buf, "clatest", 8);
+    else if (strcmp(buf, "c++98") == 0 || strcmp(buf, "c++03") == 0 ||
+             strcmp(buf, "c++11") == 0)
+        memcpy(buf, "c++14", 6);
+    else if (strcmp(buf, "c++2a") == 0)
+        memcpy(buf, "c++20", 6);
+    else if (strcmp(buf, "c++23") == 0 || strcmp(buf, "c++2b") == 0)
+        memcpy(buf, "c++latest", 10);
+    return forge__fmt("/std:%s", buf);
+}
+
 static const char *forge__ccbin(int cxx)
 {
     switch (forge_cc()) {
@@ -461,7 +494,7 @@ static int forge__mtime(const char *path, time_t *out)
     return 1;
 }
 
-static int forge__needs(const char *output, const char **in, int nin)
+static int forge__needsx(const char *output, const char **in, int nin, int require)
 {
     time_t ot, it;
     int i;
@@ -469,13 +502,21 @@ static int forge__needs(const char *output, const char **in, int nin)
         return 1;
     for (i = 0; i < nin; i++) {
         if (!forge__mtime(in[i], &it)) {
-            forge__errf("missing `%s`", in[i]);
-            return -1;
+            if (require) {
+                forge__errf("missing `%s`", in[i]);
+                return -1;
+            }
+            return 1;
         }
         if (it > ot)
             return 1;
     }
     return 0;
+}
+
+static int forge__needs(const char *output, const char **in, int nin)
+{
+    return forge__needsx(output, in, nin, 1);
 }
 
 static int forge__mkdir1(const char *path)
@@ -1172,7 +1213,7 @@ static void forge__bar_begin(int tot)
 
 static int forge__runjob(ForgeStrs *cmd)
 {
-    if (!forge__exec(cmd))
+    if (!forge__exec(cmd, 1))
         return 0;
     if (forge__bar_on)
         forge__bar_done++;
@@ -1228,8 +1269,75 @@ static void forge__cmdfail(ForgeStrs *cmd)
     fputc('\n', stderr);
 }
 
-static int forge__exec(ForgeStrs *cmd)
+static int forge__name_echo(const char *s, int n)
 {
+    static const char *exts[] = {
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm", NULL
+    };
+    const char **e;
+    int i, el;
+    if (n < 3)
+        return 0;
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= ' ' || c == ':' || c == '(')
+            return 0;
+    }
+    for (e = exts; *e; e++) {
+        el = (int)strlen(*e);
+        if (n > el) {
+            int ok = 1, j;
+            for (j = 0; j < el; j++) {
+                if (!forge__eqc(s[n - el + j], (*e)[j])) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (ok)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static void forge__emit_child(const char *buf, int n, int ok)
+{
+    char *out = NULL;
+    int i = 0, on = 0, ocap = 0;
+    if (!buf || n <= 0)
+        return;
+    while (i < n) {
+        int start = i, len;
+        while (i < n && buf[i] != '\n')
+            i++;
+        len = i - start;
+        if (len > 0 && buf[start + len - 1] == '\r')
+            len--;
+        if (!(forge__msvc() && forge__name_echo(buf + start, len))) {
+            forge__buf_add(&out, &on, &ocap, buf + start, i - start);
+            if (i < n)
+                forge__buf_add(&out, &on, &ocap, "\n", 1);
+        }
+        if (i < n)
+            i++;
+    }
+    if (!out)
+        return;
+    if (forge__bar_on)
+        forge__bar_erase();
+    fwrite(out, 1, (size_t)on, stderr);
+    if (on > 0 && out[on - 1] != '\n')
+        fputc('\n', stderr);
+    fflush(stderr);
+    if (ok && forge__bar_on)
+        forge__bar_draw();
+    free(out);
+}
+
+static int forge__exec(ForgeStrs *cmd, int capture)
+{
+    char *obuf = NULL;
+    int on = 0, ocap = 0, ok;
     if (cmd->count < 1) {
         forge__errf("empty command");
         return 0;
@@ -1240,33 +1348,88 @@ static int forge__exec(ForgeStrs *cmd)
         PROCESS_INFORMATION pi;
         char *line = forge__cmdline(cmd);
         DWORD code = 1;
+        HANDLE rd = NULL, wr = NULL;
         memset(&si, 0, sizeof(si));
         memset(&pi, 0, sizeof(pi));
         si.cb = sizeof(si);
-        if (!CreateProcessA(NULL, line, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        if (capture) {
+            SECURITY_ATTRIBUTES sa;
+            sa.nLength = sizeof(sa);
+            sa.lpSecurityDescriptor = NULL;
+            sa.bInheritHandle = TRUE;
+            if (!CreatePipe(&rd, &wr, &sa, 0)) {
+                forge__errf("CreatePipe failed (%lu)", (unsigned long)GetLastError());
+                free(line);
+                return 0;
+            }
+            SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+            si.dwFlags |= STARTF_USESTDHANDLES;
+            si.hStdInput = INVALID_HANDLE_VALUE;
+            si.hStdOutput = wr;
+            si.hStdError = wr;
+        }
+        if (!CreateProcessA(NULL, line, NULL, NULL, capture ? TRUE : FALSE,
+                0, NULL, NULL, &si, &pi)) {
             forge__errf("CreateProcess failed (%lu)", (unsigned long)GetLastError());
+            if (rd)
+                CloseHandle(rd);
+            if (wr)
+                CloseHandle(wr);
             free(line);
             return 0;
         }
         free(line);
+        if (wr)
+            CloseHandle(wr);
+        if (rd) {
+            char tmp[4096];
+            DWORD got;
+            for (;;) {
+                if (!ReadFile(rd, tmp, sizeof(tmp), &got, NULL) || got == 0)
+                    break;
+                forge__buf_add(&obuf, &on, &ocap, tmp, (int)got);
+            }
+            CloseHandle(rd);
+        }
         WaitForSingleObject(pi.hProcess, INFINITE);
         GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
-        if (code != 0)
+        ok = code == 0;
+        if (capture)
+            forge__emit_child(obuf, on, ok);
+        free(obuf);
+        if (!ok)
             forge__cmdfail(cmd);
-        return code == 0;
+        return ok;
     }
 #else
     {
-        pid_t pid = fork();
+        pid_t pid;
+        int fds[2] = { -1, -1 };
+        int st = 0;
+        if (capture && pipe(fds) != 0) {
+            forge__errf("pipe: %s", strerror(errno));
+            return 0;
+        }
+        pid = fork();
         if (pid < 0) {
             forge__errf("fork: %s", strerror(errno));
+            if (fds[0] >= 0) {
+                close(fds[0]);
+                close(fds[1]);
+            }
             return 0;
         }
         if (pid == 0) {
             char **argv = (char **)calloc((size_t)cmd->count + 1, sizeof(char *));
             int i;
+            if (capture) {
+                close(fds[0]);
+                dup2(fds[1], 1);
+                dup2(fds[1], 2);
+                close(fds[1]);
+            }
             if (!argv)
                 _exit(127);
             for (i = 0; i < cmd->count; i++)
@@ -1275,18 +1438,34 @@ static int forge__exec(ForgeStrs *cmd)
             fprintf(stderr, "execvp `%s`: %s\n", argv[0], strerror(errno));
             _exit(127);
         }
-        {
-            int st = 0;
-            if (waitpid(pid, &st, 0) < 0) {
-                forge__errf("waitpid: %s", strerror(errno));
-                return 0;
+        if (capture) {
+            char tmp[4096];
+            ssize_t r;
+            close(fds[1]);
+            for (;;) {
+                r = read(fds[0], tmp, sizeof(tmp));
+                if (r < 0 && errno == EINTR)
+                    continue;
+                if (r <= 0)
+                    break;
+                forge__buf_add(&obuf, &on, &ocap, tmp, (int)r);
             }
-            if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
-                forge__cmdfail(cmd);
-                return 0;
-            }
-            return 1;
+            close(fds[0]);
         }
+        if (waitpid(pid, &st, 0) < 0) {
+            forge__errf("waitpid: %s", strerror(errno));
+            free(obuf);
+            return 0;
+        }
+        ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        if (capture)
+            forge__emit_child(obuf, on, ok);
+        free(obuf);
+        if (!ok) {
+            forge__cmdfail(cmd);
+            return 0;
+        }
+        return 1;
     }
 #endif
 }
@@ -1435,8 +1614,11 @@ static void forge__emit_compile(ForgeStrs *cmd, ForgeTarget *t)
         forge__add1(cmd, forge__fmt(msvc ? "/I%s" : "-I%s", t->incs.items[i]));
     for (i = 0; i < t->defs.count; i++)
         forge__add1(cmd, forge__fmt(msvc ? "/D%s" : "-D%s", t->defs.items[i]));
-    if (t->std)
-        forge__add1(cmd, forge__fmt(msvc ? "/std:%s" : "-std=%s", t->std));
+    if (t->std) {
+        const char *f = forge__stdflag(t->std);
+        if (f)
+            forge__add1(cmd, f);
+    }
     if (t->opt >= 0) {
         if (msvc) {
             if (t->opt == 0)      forge__add1(cmd, "/Od");
@@ -1510,7 +1692,7 @@ static int forge__jobs(ForgeTarget *t)
         forge__add1(&inputs, objs.items[i]);
     for (i = 0; i < arts.count; i++)
         forge__add1(&inputs, arts.items[i]);
-    need = forge__needs(out, inputs.items, inputs.count);
+    need = forge__needsx(out, inputs.items, inputs.count, 0);
     if (need < 0)
         return -1;
     if (need)
@@ -1752,7 +1934,7 @@ void forge__rebuild(int argc, char **argv, const char *src, ...)
         forge__add1(&cmd, bin);
         forge__add1(&cmd, src);
     }
-    if (!forge__exec(&cmd)) {
+    if (!forge__exec(&cmd, 1)) {
 #ifdef _WIN32
         MoveFileA(oldp, (char *)bin);
 #else
@@ -1765,7 +1947,7 @@ void forge__rebuild(int argc, char **argv, const char *src, ...)
     forge__add1(&cmd, bin);
     for (i = 1; i < argc; i++)
         forge__add1(&cmd, argv[i]);
-    i = forge__exec(&cmd);
+    i = forge__exec(&cmd, 0);
     exit(i ? 0 : 1);
 }
 
