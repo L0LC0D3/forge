@@ -44,6 +44,10 @@ FORGE_MAIN {
 ```
 cc -o build build.c
 ./build
+./build hello
+./build --rebuild
+./build --clean
+./build --verbose
 ```
 
 MSVC: `cl build.c`

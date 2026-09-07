@@ -147,7 +147,7 @@ typedef struct ForgeTarget {
 
 void forge__rebuild(int argc, char **argv, const char *src, ...);
 void forge__init(void);
-int  forge__run(void);
+int  forge__run(int argc, char **argv);
 ForgeTarget *forge__cur(void);
 ForgeTarget *forge__begin(int kind, const char *name);
 ForgeTarget *forge__end(ForgeTarget *t);
@@ -201,7 +201,7 @@ void forge__pkg(const char *name);
         forge__rebuild(argc, argv, __FILE__, NULL); \
         forge__init(); \
         forge__recipe(argc, argv); \
-        return forge__run() ? 0 : 1; \
+        return forge__run(argc, argv) ? 0 : 1; \
     } \
     static void forge__recipe(int argc FORGE__UNUSED, char **argv FORGE__UNUSED)
 
@@ -211,7 +211,7 @@ void forge__pkg(const char *name);
         forge__rebuild(argc, argv, __FILE__, __VA_ARGS__, NULL); \
         forge__init(); \
         forge__recipe(argc, argv); \
-        return forge__run() ? 0 : 1; \
+        return forge__run(argc, argv) ? 0 : 1; \
     } \
     static void forge__recipe(int argc FORGE__UNUSED, char **argv FORGE__UNUSED)
 
@@ -255,6 +255,7 @@ static int          forge__bar_on;
 static int          forge__bar_tot;
 static int          forge__bar_done;
 static const char  *forge__bar_name;
+static int          forge__verbose;
 
 static void forge__errf(const char *fmt, ...);
 static int  forge__exec(ForgeStrs *cmd, int capture);
@@ -841,6 +842,95 @@ static void forge__dclose(forge__dir *d)
 #endif
 }
 
+static int forge__rm_file(const char *path)
+{
+#ifdef _WIN32
+    if (DeleteFileA(path))
+        return 1;
+    {
+        DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
+            return 1;
+        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+        if (DeleteFileA(path))
+            return 1;
+        forge__errf("remove `%s` failed (%lu)", path, (unsigned long)GetLastError());
+        return 0;
+    }
+#else
+    if (unlink(path) == 0 || errno == ENOENT)
+        return 1;
+    forge__errf("remove `%s`: %s", path, strerror(errno));
+    return 0;
+#endif
+}
+
+static int forge__rm_rf(const char *path)
+{
+    forge__dir dd;
+    char name[1024];
+    ForgeStrs kids = {0};
+    int i;
+
+#ifdef _WIN32
+    {
+        DWORD a = GetFileAttributesA(path);
+        if (a == INVALID_FILE_ATTRIBUTES) {
+            DWORD e = GetLastError();
+            return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+        }
+        if (a & FILE_ATTRIBUTE_DIRECTORY) {
+            if (a & FILE_ATTRIBUTE_REPARSE_POINT) {
+                if (RemoveDirectoryA(path))
+                    return 1;
+                forge__errf("rmdir `%s` failed (%lu)",
+                        path, (unsigned long)GetLastError());
+                return 0;
+            }
+        } else {
+            return forge__rm_file(path);
+        }
+    }
+#else
+    {
+        struct stat st;
+        if (lstat(path, &st) != 0)
+            return errno == ENOENT;
+        if (!S_ISDIR(st.st_mode))
+            return forge__rm_file(path);
+    }
+#endif
+    if (!forge__dopen(&dd, path)) {
+        forge__errf("opendir `%s` failed", path);
+        return 0;
+    }
+    while (forge__dread(&dd, name, (int)sizeof(name))) {
+        if (forge__isdot(name))
+            continue;
+        forge__add1(&kids, forge__fmt("%s/%s", path, name));
+    }
+    forge__dclose(&dd);
+    for (i = 0; i < kids.count; i++) {
+        if (!forge__rm_rf(kids.items[i]))
+            return 0;
+    }
+#ifdef _WIN32
+    if (!RemoveDirectoryA(path)) {
+        DWORD e = GetLastError();
+        if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
+            forge__errf("rmdir `%s` failed (%lu)", path, (unsigned long)e);
+            return 0;
+        }
+    }
+#else
+    if (rmdir(path) != 0 && errno != ENOENT) {
+        forge__errf("rmdir `%s`: %s", path, strerror(errno));
+        return 0;
+    }
+#endif
+    return 1;
+}
+
 static void forge__ppush(char **buf, int *n, int *cap, const char *name)
 {
     if (*n > 0 && (*buf)[*n - 1] != '/')
@@ -1200,7 +1290,7 @@ static void forge__bar_begin(int tot)
     forge__bar_tot = tot;
     forge__bar_done = 0;
     forge__bar_name = NULL;
-    forge__bar_on = tot > 0 && forge__tty();
+    forge__bar_on = tot > 0 && forge__tty() && !forge__verbose;
     if (!forge__bar_on)
         return;
     if (!once) {
@@ -1211,8 +1301,26 @@ static void forge__bar_begin(int tot)
     forge__bar_draw();
 }
 
+static void forge__printcmd(ForgeStrs *cmd)
+{
+    int i;
+    if (forge__bar_on)
+        forge__bar_erase();
+    fprintf(stderr, "         ");
+    for (i = 0; i < cmd->count; i++) {
+        if (i)
+            fputc(' ', stderr);
+        fputs(cmd->items[i], stderr);
+    }
+    fputc('\n', stderr);
+    if (forge__bar_on)
+        forge__bar_draw();
+}
+
 static int forge__runjob(ForgeStrs *cmd)
 {
+    if (forge__verbose)
+        forge__printcmd(cmd);
     if (!forge__exec(cmd, 1))
         return 0;
     if (forge__bar_on)
@@ -1848,22 +1956,270 @@ static int forge__need(ForgeTarget *t)
     return 1;
 }
 
-int forge__run(void)
+static int forge__outdir_ok(const char *p)
 {
-    int i, tot = 0, ok = 1;
+    const char *s;
+    if (!p || !p[0] || forge__is_root(p))
+        return 0;
+    if (strcmp(p, ".") == 0 || strcmp(p, "..") == 0)
+        return 0;
+    for (s = p; *s; ) {
+        if (s[0] == '.' && s[1] == '.' &&
+                (s[2] == '\0' || s[2] == '/' || s[2] == '\\'))
+            return 0;
+        while (*s && *s != '/' && *s != '\\')
+            s++;
+        if (*s)
+            s++;
+    }
+    return 1;
+}
+
+static int forge__clean(void)
+{
+    ForgeStrs dirs = {0};
+    int i, j;
+    for (i = 0; i < forge__ntargets; i++) {
+        ForgeTarget *t = &forge__targets[i];
+        if (t->kind == FORGE_KIND_IMPORT)
+            continue;
+        if (!t->outdir || forge__has(&dirs, t->outdir))
+            continue;
+        forge__add1(&dirs, t->outdir);
+    }
+    for (i = 0; i < dirs.count; i++) {
+        const char *d = dirs.items[i];
+        forge__say("CLEAN", d);
+        if (forge__outdir_ok(d)) {
+            if (!forge__rm_rf(d))
+                return 0;
+            continue;
+        }
+        for (j = 0; j < forge__ntargets; j++) {
+            ForgeTarget *t = &forge__targets[j];
+            const char *out, *lf;
+            if (t->kind == FORGE_KIND_IMPORT || !t->outdir ||
+                    strcmp(t->outdir, d) != 0)
+                continue;
+            out = forge__out(t);
+            if (out && !forge__rm_rf(out))
+                return 0;
+            lf = forge__linkfile(t);
+            if (lf && (!out || strcmp(lf, out) != 0) && !forge__rm_rf(lf))
+                return 0;
+            if (!forge__rm_rf(forge__fmt("%s/%s", t->outdir, t->name)))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static void forge__clear_color(void)
+{
+    int i;
+    for (i = 0; i < forge__ntargets; i++)
+        forge__targets[i].color = 0;
+}
+
+static int forge__clean_one(ForgeTarget *t)
+{
+    const char *out, *lf;
+    if (t->kind == FORGE_KIND_IMPORT)
+        return 1;
+    forge__say("CLEAN", t->name);
+    out = forge__out(t);
+    if (out && !forge__rm_rf(out))
+        return 0;
+    lf = forge__linkfile(t);
+    if (lf && (!out || strcmp(lf, out) != 0) && !forge__rm_rf(lf))
+        return 0;
+    return forge__rm_rf(forge__fmt("%s/%s", t->outdir, t->name));
+}
+
+static int forge__clean_root(ForgeTarget *t)
+{
+    int i;
+    if (t->color == 2)
+        return 1;
+    if (t->color == 1) {
+        forge__errf("cyclic FORGE_USE involving `%s`", t->name);
+        return 0;
+    }
+    t->color = 1;
+    for (i = 0; i < t->uses.count; i++) {
+        ForgeTarget *u = forge__find(t->uses.items[i]);
+        if (!u) {
+            forge__errf("unknown target `%s` (used by `%s`)",
+                    t->uses.items[i], t->name);
+            return 0;
+        }
+        if (!forge__clean_root(u))
+            return 0;
+    }
+    if (t->kind != FORGE_KIND_IMPORT && !forge__clean_one(t))
+        return 0;
+    t->color = 2;
+    return 1;
+}
+
+static int forge__jobs_root(ForgeTarget *t)
+{
+    int i, n = 0, k;
+    if (t->color == 2)
+        return 0;
+    if (t->color == 1) {
+        forge__errf("cyclic FORGE_USE involving `%s`", t->name);
+        return -1;
+    }
+    t->color = 1;
+    for (i = 0; i < t->uses.count; i++) {
+        ForgeTarget *u = forge__find(t->uses.items[i]);
+        if (!u) {
+            forge__errf("unknown target `%s` (used by `%s`)",
+                    t->uses.items[i], t->name);
+            return -1;
+        }
+        k = forge__jobs_root(u);
+        if (k < 0)
+            return -1;
+        n += k;
+    }
+    if (t->kind != FORGE_KIND_IMPORT) {
+        k = forge__jobs(t);
+        if (k < 0)
+            return -1;
+        n += k;
+    }
+    t->color = 2;
+    return n;
+}
+
+static void forge__help(const char *argv0)
+{
+    int i, n = 0;
+    printf("Usage: %s [option]... [target]...\n", forge__base(argv0));
+    printf("  --rebuild   delete outputs and rebuild\n");
+    printf("  --clean     delete outputs\n");
+    printf("  --verbose   print compiler commands\n");
+    printf("  -h, --help  show this help\n");
+    for (i = 0; i < forge__ntargets; i++) {
+        if (forge__targets[i].kind != FORGE_KIND_IMPORT)
+            n++;
+    }
+    if (n) {
+        printf("\nTargets:\n");
+        for (i = 0; i < forge__ntargets; i++) {
+            if (forge__targets[i].kind != FORGE_KIND_IMPORT)
+                printf("  %s\n", forge__targets[i].name);
+        }
+    }
+}
+
+static int forge__args(int argc, char **argv, int *rebuild, int *clean, ForgeStrs *want)
+{
+    int i, rest = 0;
+    *rebuild = 0;
+    *clean = 0;
+    forge__verbose = 0;
+    for (i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!rest && strcmp(a, "--") == 0) {
+            rest = 1;
+            continue;
+        }
+        if (!rest && a[0] == '-' && a[1]) {
+            if (strcmp(a, "--rebuild") == 0)
+                *rebuild = 1;
+            else if (strcmp(a, "--clean") == 0)
+                *clean = 1;
+            else if (strcmp(a, "--verbose") == 0)
+                forge__verbose = 1;
+            else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
+                forge__help(argv[0]);
+                return 0;
+            } else {
+                forge__errf("unknown option `%s`", a);
+                return -1;
+            }
+            continue;
+        }
+        forge__add1(want, a);
+    }
+    return 1;
+}
+
+static int forge__resolve(ForgeStrs *want)
+{
+    int i;
+    for (i = 0; i < want->count; i++) {
+        ForgeTarget *t = forge__find(want->items[i]);
+        if (!t) {
+            forge__errf("unknown target `%s`", want->items[i]);
+            return 0;
+        }
+        if (t->kind == FORGE_KIND_IMPORT) {
+            forge__errf("target `%s` is an import", t->name);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int forge__run(int argc, char **argv)
+{
+    ForgeStrs want = {0};
+    int i, tot = 0, ok = 1, rebuild = 0, clean = 0, args;
     if (forge__err)
         return 0;
-    for (i = 0; i < forge__ntargets; i++) {
-        int n = forge__jobs(&forge__targets[i]);
-        if (n < 0)
-            return 0;
-        tot += n;
+    args = forge__args(argc, argv, &rebuild, &clean, &want);
+    if (args < 0)
+        return 0;
+    if (args == 0)
+        return 1;
+    if (want.count > 0 && !forge__resolve(&want))
+        return 0;
+    if (clean || rebuild) {
+        if (want.count < 1) {
+            if (!forge__clean())
+                return 0;
+        } else {
+            for (i = 0; i < want.count; i++) {
+                if (!forge__clean_root(forge__find(want.items[i])))
+                    return 0;
+            }
+            forge__clear_color();
+        }
     }
-    forge__bar_begin(tot);
-    for (i = 0; i < forge__ntargets; i++) {
-        if (!forge__need(&forge__targets[i])) {
-            ok = 0;
-            break;
+    if (clean && !rebuild)
+        return 1;
+    if (want.count < 1) {
+        for (i = 0; i < forge__ntargets; i++) {
+            int n = forge__jobs(&forge__targets[i]);
+            if (n < 0)
+                return 0;
+            tot += n;
+        }
+        forge__bar_begin(tot);
+        for (i = 0; i < forge__ntargets; i++) {
+            if (!forge__need(&forge__targets[i])) {
+                ok = 0;
+                break;
+            }
+        }
+    } else {
+        for (i = 0; i < want.count; i++) {
+            int n = forge__jobs_root(forge__find(want.items[i]));
+            if (n < 0)
+                return 0;
+            tot += n;
+        }
+        forge__clear_color();
+        forge__bar_begin(tot);
+        for (i = 0; i < want.count; i++) {
+            if (!forge__need(forge__find(want.items[i]))) {
+                ok = 0;
+                break;
+            }
         }
     }
     forge__bar_off();
@@ -1908,6 +2264,11 @@ void forge__rebuild(int argc, char **argv, const char *src, ...)
     if (!need)
         return;
 
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--verbose") == 0)
+            forge__verbose = 1;
+    }
+
     oldp = forge__fmt("%s.old", bin);
 #ifdef _WIN32
     DeleteFileA(oldp);
@@ -1934,6 +2295,8 @@ void forge__rebuild(int argc, char **argv, const char *src, ...)
         forge__add1(&cmd, bin);
         forge__add1(&cmd, src);
     }
+    if (forge__verbose)
+        forge__printcmd(&cmd);
     if (!forge__exec(&cmd, 1)) {
 #ifdef _WIN32
         MoveFileA(oldp, (char *)bin);
