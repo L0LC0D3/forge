@@ -152,6 +152,7 @@ ForgeTarget *forge__cur(void);
 ForgeTarget *forge__begin(int kind, const char *name);
 ForgeTarget *forge__end(ForgeTarget *t);
 void forge__add(ForgeStrs *s, ...);
+void forge__add_src(ForgeStrs *s, ...);
 void forge__pkg(const char *name);
 
 #define FORGE_ON_WINDOWS  if (forge_os() == FORGE_OS_WINDOWS)
@@ -170,7 +171,7 @@ void forge__pkg(const char *name);
 #define FORGE_IMPORT(name) \
     for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_IMPORT, #name); forge__t; forge__t = forge__end(forge__t))
 
-#define FORGE_SRC(...)         forge__add(&forge__cur()->srcs, __VA_ARGS__, NULL)
+#define FORGE_SRC(...)         forge__add_src(&forge__cur()->srcs, __VA_ARGS__, NULL)
 #define FORGE_INC(...)         forge__add(&forge__cur()->incs, __VA_ARGS__, NULL)
 #define FORGE_DEF(...)         forge__add(&forge__cur()->defs, __VA_ARGS__, NULL)
 #define FORGE_LIBDIR(...)      forge__add(&forge__cur()->libdirs, __VA_ARGS__, NULL)
@@ -238,6 +239,8 @@ void forge__pkg(const char *name);
 #  include <sys/types.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
+#  include <dirent.h>
+#  include <sys/ioctl.h>
 #  define forge__popen  popen
 #  define forge__pclose pclose
 #endif
@@ -248,8 +251,13 @@ static ForgeTarget *forge__targets;
 static int          forge__ntargets;
 static int          forge__tcap;
 static int          forge__err;
+static int          forge__bar_on;
+static int          forge__bar_tot;
+static int          forge__bar_done;
+static const char  *forge__bar_name;
 
 static void forge__errf(const char *fmt, ...);
+static int  forge__exec(ForgeStrs *cmd);
 
 static void forge__oom(void)
 {
@@ -433,6 +441,11 @@ static const char *forge__base(const char *p)
     return b;
 }
 
+static const char *forge__obj(const char *dir, const char *src)
+{
+    return forge__fmt("%s/%s%s", dir, forge__base(src), forge__objext());
+}
+
 static int forge__mtime(const char *path, time_t *out)
 {
 #ifdef _MSC_VER
@@ -520,7 +533,6 @@ static int forge__mkdirs(const char *path)
     return 1;
 }
 
-#ifdef _WIN32
 static void forge__buf_add(char **buf, int *n, int *cap, const char *s, int len)
 {
     if (*n + len + 1 > *cap) {
@@ -536,6 +548,464 @@ static void forge__buf_add(char **buf, int *n, int *cap, const char *s, int len)
     (*buf)[*n] = '\0';
 }
 
+static int forge__esc(const char **p)
+{
+#ifndef _WIN32
+    if (**p == '\\' && (*p)[1]) {
+        (*p)++;
+        return 1;
+    }
+#else
+    (void)p;
+#endif
+    return 0;
+}
+
+static int forge__low(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
+static int forge__eqc(int a, int b)
+{
+#ifdef _WIN32
+    return forge__low(a) == forge__low(b);
+#else
+    return a == b;
+#endif
+}
+
+static int forge__class(const char **pp, int ch)
+{
+    const char *p = *pp + 1;
+    int neg = 0, ok = 0, a, b, c = ch;
+    if (*p == '!' || *p == '^') {
+        neg = 1;
+        p++;
+    }
+    if (*p == ']') {
+        ok = c == ']';
+        p++;
+    }
+    if (!*p)
+        return -1;
+    while (*p != ']') {
+        if (!*p)
+            return -1;
+        if (p[1] == '-' && p[2] && p[2] != ']') {
+            a = (unsigned char)p[0];
+            b = (unsigned char)p[2];
+#ifdef _WIN32
+            a = forge__low(a);
+            b = forge__low(b);
+            c = forge__low(ch);
+#endif
+            if (a <= c && c <= b)
+                ok = 1;
+            p += 3;
+            continue;
+        }
+        if (forge__eqc((unsigned char)*p, ch))
+            ok = 1;
+        p++;
+    }
+    *pp = p;
+    return neg ? !ok : ok;
+}
+
+static int forge__dotok(const char *pat)
+{
+    const char *p = pat;
+    if (*p == '.')
+        return 1;
+    if (*p == '[')
+        return forge__class(&p, '.') == 1;
+    return 0;
+}
+
+static int forge__gmatch(const char *pat, const char *str)
+{
+    const char *p = pat, *s = str, *bp = NULL, *bs = NULL;
+    if (*s == '.' && !forge__dotok(p))
+        return 0;
+    while (*s) {
+        if (*p == '*') {
+            while (p[1] == '*')
+                p++;
+            bp = ++p;
+            bs = s;
+            continue;
+        }
+        if (forge__esc(&p)) {
+            if (!*p || !forge__eqc((unsigned char)*p, (unsigned char)*s))
+                goto star;
+            p++;
+            s++;
+            continue;
+        }
+        if (*p == '?') {
+            p++;
+            s++;
+            continue;
+        }
+        if (*p == '[') {
+            const char *pp = p;
+            int r = forge__class(&pp, (unsigned char)*s);
+            if (r > 0) {
+                p = pp + 1;
+                s++;
+                continue;
+            }
+            if (r == 0)
+                goto star;
+        }
+        if (*p && forge__eqc((unsigned char)*p, (unsigned char)*s)) {
+            p++;
+            s++;
+            continue;
+        }
+    star:
+        if (!bp)
+            return 0;
+        p = bp;
+        s = ++bs;
+    }
+    while (*p == '*')
+        p++;
+    return *p == '\0';
+}
+
+static int forge__starstar(const char *s)
+{
+    return s[0] == '*' && s[1] == '*' && s[2] == '\0';
+}
+
+static int forge__gwild(const char *s)
+{
+    for (; *s; s++) {
+        if (forge__esc(&s))
+            continue;
+        if (*s == '*' || *s == '?' || *s == '[')
+            return 1;
+    }
+    return 0;
+}
+
+static int forge__hasglob(const char *s)
+{
+    int depth = 0, comma = 0;
+    for (; *s; s++) {
+        if (forge__esc(&s))
+            continue;
+        if (*s == '*' || *s == '?' || *s == '[')
+            return 1;
+        if (*s == '{') {
+            depth++;
+            comma = 0;
+        } else if (*s == ',' && depth)
+            comma = 1;
+        else if (*s == '}' && depth) {
+            if (comma)
+                return 1;
+            depth--;
+        }
+    }
+    return 0;
+}
+
+static int forge__isdot(const char *n)
+{
+    return n[0] == '.' && (!n[1] || (n[1] == '.' && !n[2]));
+}
+
+static int forge__isfile(const char *path)
+{
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+static int forge__can_enter(const char *path)
+{
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES
+        && (a & FILE_ATTRIBUTE_DIRECTORY)
+        && !(a & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+typedef struct {
+#ifdef _WIN32
+    HANDLE h;
+    WIN32_FIND_DATAA fd;
+    int first;
+#else
+    DIR *d;
+#endif
+} forge__dir;
+
+static int forge__dopen(forge__dir *d, const char *path)
+{
+    path = path && path[0] ? path : ".";
+#ifdef _WIN32
+    {
+        char pat[1024];
+        snprintf(pat, sizeof(pat), "%s\\*", path);
+        d->h = FindFirstFileA(pat, &d->fd);
+        d->first = 1;
+        return d->h != INVALID_HANDLE_VALUE;
+    }
+#else
+    d->d = opendir(path);
+    return d->d != NULL;
+#endif
+}
+
+static int forge__dread(forge__dir *d, char *name, int n)
+{
+    const char *src;
+#ifdef _WIN32
+    if (d->first)
+        d->first = 0;
+    else if (!FindNextFileA(d->h, &d->fd))
+        return 0;
+    src = d->fd.cFileName;
+#else
+    struct dirent *de = readdir(d->d);
+    if (!de)
+        return 0;
+    src = de->d_name;
+#endif
+    strncpy(name, src, (size_t)n - 1);
+    name[n - 1] = '\0';
+    return 1;
+}
+
+static void forge__dclose(forge__dir *d)
+{
+#ifdef _WIN32
+    if (d->h != INVALID_HANDLE_VALUE)
+        FindClose(d->h);
+#else
+    if (d->d)
+        closedir(d->d);
+#endif
+}
+
+static void forge__ppush(char **buf, int *n, int *cap, const char *name)
+{
+    if (*n > 0 && (*buf)[*n - 1] != '/')
+        forge__buf_add(buf, n, cap, "/", 1);
+    forge__buf_add(buf, n, cap, name, (int)strlen(name));
+}
+
+static void forge__prew(char **buf, int *n, int save)
+{
+    *n = save;
+    if (*buf)
+        (*buf)[save] = '\0';
+}
+
+static const char *forge__gdir(char **buf, int n)
+{
+    return n && *buf ? *buf : ".";
+}
+
+static void forge__gwalk(char **buf, int *n, int *cap, char **segs, int nseg, ForgeStrs *out)
+{
+    int save = *n, i, hide;
+    forge__dir dd;
+    char name[1024];
+
+    if (nseg <= 0) {
+        if (*n && *buf && forge__isfile(*buf))
+            forge__add1(out, forge__dup(*buf));
+        return;
+    }
+
+    if (forge__starstar(segs[0])) {
+        i = 0;
+        while (i < nseg && forge__starstar(segs[i]))
+            i++;
+        forge__gwalk(buf, n, cap, segs + i, nseg - i, out);
+        if (!forge__dopen(&dd, forge__gdir(buf, *n)))
+            return;
+        while (forge__dread(&dd, name, (int)sizeof(name))) {
+            if (forge__isdot(name) || name[0] == '.')
+                continue;
+            forge__ppush(buf, n, cap, name);
+            if (forge__can_enter(*buf))
+                forge__gwalk(buf, n, cap, segs + i - 1, nseg - i + 1, out);
+            forge__prew(buf, n, save);
+        }
+        forge__dclose(&dd);
+        return;
+    }
+
+    if (!forge__gwild(segs[0])) {
+        forge__ppush(buf, n, cap, segs[0]);
+        forge__gwalk(buf, n, cap, segs + 1, nseg - 1, out);
+        forge__prew(buf, n, save);
+        return;
+    }
+
+    hide = !forge__dotok(segs[0]);
+    if (!forge__dopen(&dd, forge__gdir(buf, *n)))
+        return;
+    while (forge__dread(&dd, name, (int)sizeof(name))) {
+        if (forge__isdot(name) || (hide && name[0] == '.'))
+            continue;
+        if (!forge__gmatch(segs[0], name))
+            continue;
+        forge__ppush(buf, n, cap, name);
+        forge__gwalk(buf, n, cap, segs + 1, nseg - 1, out);
+        forge__prew(buf, n, save);
+    }
+    forge__dclose(&dd);
+}
+
+static void forge__gpat(const char *pattern, ForgeStrs *out)
+{
+    char *dup = forge__dup(pattern);
+    char *segs[64];
+    char *p, *buf = NULL;
+    int nseg = 0, n = 0, cap = 0, i;
+
+    for (i = 0; dup[i]; i++)
+        if (dup[i] == '\\')
+            dup[i] = '/';
+    p = dup;
+    if (p[0] && p[1] == ':') {
+        forge__buf_add(&buf, &n, &cap, p, 2);
+        p += 2;
+        if (*p == '/') {
+            forge__buf_add(&buf, &n, &cap, "/", 1);
+            p++;
+        }
+    } else if (*p == '/') {
+        forge__buf_add(&buf, &n, &cap, "/", 1);
+        p++;
+    }
+    while (*p && nseg < 64) {
+        segs[nseg++] = p;
+        while (*p && *p != '/')
+            p++;
+        if (*p)
+            *p++ = '\0';
+        if (!segs[nseg - 1][0])
+            nseg--;
+    }
+    forge__gwalk(&buf, &n, &cap, segs, nseg, out);
+    free(dup);
+    free(buf);
+}
+
+static void forge__gbrace(const char *pre, const char *pat, ForgeStrs *out)
+{
+    const char *p, *open = NULL, *close = NULL, *al;
+    int depth = 0, comma = 0;
+    for (p = pat; *p; p++) {
+        if (forge__esc(&p))
+            continue;
+        if (*p == '{') {
+            if (depth == 0)
+                open = p;
+            depth++;
+        } else if (*p == ',' && depth == 1) {
+            comma = 1;
+        } else if (*p == '}' && depth) {
+            if (depth == 1 && comma && open) {
+                close = p;
+                break;
+            }
+            depth--;
+        }
+    }
+    if (!close) {
+        forge__add1(out, forge__fmt("%s%s", pre, pat));
+        return;
+    }
+    al = open + 1;
+    depth = 1;
+    for (p = open + 1; p <= close; p++) {
+        if (p < close && forge__esc(&p))
+            continue;
+        if (*p == '{')
+            depth++;
+        else if (*p == '}' || *p == ',') {
+            if (*p == '}')
+                depth--;
+            if ((*p == ',' && depth == 1) || (*p == '}' && depth == 0)) {
+                char *np = forge__fmt("%s%.*s%.*s", pre,
+                        (int)(open - pat), pat, (int)(p - al), al);
+                forge__gbrace(np, close + 1, out);
+                free(np);
+                al = p + 1;
+            }
+        }
+    }
+}
+
+static int forge__cmpstr(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static int forge__glob(const char *pattern, ForgeStrs *out)
+{
+    ForgeStrs pats = {0};
+    int i, start = out->count, w;
+    forge__gbrace("", pattern, &pats);
+    for (i = 0; i < pats.count; i++)
+        forge__gpat(pats.items[i], out);
+    for (i = 0; i < pats.count; i++)
+        free((void *)pats.items[i]);
+    free(pats.items);
+    if (out->count <= start)
+        return 1;
+    qsort(out->items + start, (size_t)(out->count - start), sizeof(char *), forge__cmpstr);
+    w = start + 1;
+    for (i = start + 1; i < out->count; i++) {
+        if (strcmp(out->items[i], out->items[w - 1]) == 0)
+            free((void *)out->items[i]);
+        else
+            out->items[w++] = out->items[i];
+    }
+    out->count = w;
+    return 0;
+}
+
+void forge__add_src(ForgeStrs *s, ...)
+{
+    va_list ap;
+    const char *x;
+    va_start(ap, s);
+    while ((x = va_arg(ap, const char *)) != NULL) {
+        if (forge__hasglob(x)) {
+            ForgeStrs g = {0};
+            if (forge__glob(x, &g) != 0) {
+                forge__errf("no files match `%s`", x);
+                forge__err = 1;
+            } else {
+                forge__strs_cat(s, &g);
+            }
+            free(g.items);
+        } else {
+            forge__add1(s, x);
+        }
+    }
+    va_end(ap);
+}
+
+#ifdef _WIN32
 static char *forge__cmdline(ForgeStrs *cmd)
 {
     char *out = NULL;
@@ -573,6 +1043,27 @@ static char *forge__cmdline(ForgeStrs *cmd)
 }
 #endif
 
+static int forge__tty(void)
+{
+    static int once, yes;
+#ifdef _WIN32
+    HANDLE h;
+    DWORD mode = 0;
+#endif
+    if (once)
+        return yes;
+    once = 1;
+#ifdef _WIN32
+    h = GetStdHandle(STD_ERROR_HANDLE);
+    if (!GetConsoleMode(h, &mode))
+        return 0;
+    yes = SetConsoleMode(h, mode | 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */) ? 1 : 0;
+#else
+    yes = isatty(STDERR_FILENO);
+#endif
+    return yes;
+}
+
 static int forge__color(void)
 {
     static int once, yes;
@@ -581,25 +1072,111 @@ static int forge__color(void)
         return yes;
     once = 1;
     no = getenv("NO_COLOR");
-    if (no && no[0]) {
-        yes = 0;
-        return 0;
-    }
+    yes = !(no && no[0]) && forge__tty();
+    return yes;
+}
+
+static int forge__cols(void)
+{
 #ifdef _WIN32
-    {
-        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
-        DWORD mode = 0;
-        if (!GetConsoleMode(h, &mode)) {
-            yes = 0;
-            return 0;
-        }
-        yes = SetConsoleMode(h, mode | 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */) ? 1 : 0;
-        return yes;
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (GetConsoleScreenBufferInfo(h, &info)) {
+        int w = info.srWindow.Right - info.srWindow.Left + 1;
+        if (w > 20)
+            return w;
     }
 #else
-    yes = isatty(STDERR_FILENO);
-    return yes;
+    struct winsize ws;
+    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20)
+        return ws.ws_col;
 #endif
+    return 80;
+}
+
+static void forge__bar_erase(void)
+{
+    if (forge__bar_on)
+        fputs("\r\033[K", stderr);
+}
+
+static void forge__bar_off(void)
+{
+    if (!forge__bar_on)
+        return;
+    forge__bar_erase();
+    fputs("\033[?25h", stderr);
+    fflush(stderr);
+    forge__bar_on = 0;
+}
+
+static void forge__bar_draw(void)
+{
+    char bar[48], line[512];
+    int cols, inner = 20, fill, i, n, cur;
+    const char *name;
+
+    if (!forge__bar_on)
+        return;
+    cols = forge__cols();
+    if (cols > 500)
+        cols = 500;
+    cur = forge__bar_name ? forge__bar_done + 1 : forge__bar_done;
+    if (cur > forge__bar_tot)
+        cur = forge__bar_tot;
+    fill = forge__bar_tot ? (inner * cur) / forge__bar_tot : 0;
+    if (cur > 0 && fill == 0)
+        fill = 1;
+    if (fill == inner && cur < forge__bar_tot)
+        fill = inner - 1;
+    for (i = 0; i < inner; i++) {
+        if (fill > 0 && i == fill - 1 && fill < inner)
+            bar[i] = '>';
+        else if (i < fill)
+            bar[i] = '=';
+        else
+            bar[i] = ' ';
+    }
+    bar[inner] = '\0';
+    name = forge__bar_name ? forge__bar_name : "";
+    if (name[0])
+        n = snprintf(line, sizeof(line), "  [%s] %d/%d    %s",
+                bar, cur, forge__bar_tot, name);
+    else
+        n = snprintf(line, sizeof(line), "  [%s] %d/%d",
+                bar, cur, forge__bar_tot);
+    if (n < 0)
+        n = 0;
+    if (n >= cols)
+        line[cols - 1] = '\0';
+    fprintf(stderr, "\r\033[K%s", line);
+    fflush(stderr);
+}
+
+static void forge__bar_begin(int tot)
+{
+    static int once;
+    forge__bar_tot = tot;
+    forge__bar_done = 0;
+    forge__bar_name = NULL;
+    forge__bar_on = tot > 0 && forge__tty();
+    if (!forge__bar_on)
+        return;
+    if (!once) {
+        atexit(forge__bar_off);
+        once = 1;
+    }
+    fputs("\033[?25l", stderr);
+    forge__bar_draw();
+}
+
+static int forge__runjob(ForgeStrs *cmd)
+{
+    if (!forge__exec(cmd))
+        return 0;
+    if (forge__bar_on)
+        forge__bar_done++;
+    return 1;
 }
 
 static void forge__say(const char *tag, const char *path)
@@ -613,15 +1190,21 @@ static void forge__say(const char *tag, const char *path)
         col = "\033[1;32m";
     else if (strcmp(tag, "DLL") == 0)
         col = "\033[1;35m";
+    if (forge__bar_on)
+        forge__bar_erase();
     if (forge__color())
         fprintf(stderr, "  %s%-6s\033[0m %s\n", col, tag, path);
     else
         fprintf(stderr, "  %-6s %s\n", tag, path);
+    if (forge__bar_on)
+        forge__bar_draw();
 }
 
 static void forge__errf(const char *fmt, ...)
 {
     va_list ap;
+    if (forge__bar_on)
+        forge__bar_off();
     if (forge__color())
         fprintf(stderr, "  \033[1;31merror\033[0m  ");
     else
@@ -899,6 +1482,42 @@ static void forge__emit_lib(ForgeStrs *cmd, const char *lib)
         forge__add1(cmd, forge__fmt("-l%s", lib));
 }
 
+static int forge__jobs(ForgeTarget *t)
+{
+    ForgeTarget acc;
+    ForgeStrs arts = {0}, seen = {0}, objs = {0}, inputs = {0};
+    int i, n = 0, need;
+    const char *out;
+    char *objdir;
+
+    if (t->kind == FORGE_KIND_IMPORT || t->srcs.count < 1)
+        return 0;
+    objdir = forge__fmt("%s/%s", t->outdir, t->name);
+    for (i = 0; i < t->srcs.count; i++) {
+        const char *src = t->srcs.items[i];
+        const char *obj = forge__obj(objdir, src);
+        need = forge__needs(obj, &src, 1);
+        if (need < 0)
+            return -1;
+        if (need)
+            n++;
+        forge__add1(&objs, obj);
+    }
+    memset(&acc, 0, sizeof(acc));
+    forge__gather(t, &acc, &arts, &seen);
+    out = forge__out(t);
+    for (i = 0; i < objs.count; i++)
+        forge__add1(&inputs, objs.items[i]);
+    for (i = 0; i < arts.count; i++)
+        forge__add1(&inputs, arts.items[i]);
+    need = forge__needs(out, inputs.items, inputs.count);
+    if (need < 0)
+        return -1;
+    if (need)
+        n++;
+    return n;
+}
+
 static int forge__build(ForgeTarget *t)
 {
     ForgeTarget acc;
@@ -911,6 +1530,7 @@ static int forge__build(ForgeTarget *t)
         forge__errf("target `%s` has no sources", t->name);
         return 0;
     }
+    forge__bar_name = t->name;
 
     memset(&acc, 0, sizeof(acc));
     acc.kind = t->kind;
@@ -932,7 +1552,7 @@ static int forge__build(ForgeTarget *t)
 
     for (i = 0; i < t->srcs.count; i++) {
         const char *src = t->srcs.items[i];
-        const char *obj = forge__fmt("%s/%s%s", objdir, forge__base(src), forge__objext());
+        const char *obj = forge__obj(objdir, src);
         int is_cxx = forge__cxx(src);
         if (is_cxx)
             cxx = 1;
@@ -954,7 +1574,7 @@ static int forge__build(ForgeTarget *t)
             forge__emit_compile(&cmd, &acc);
             forge__add1(&cmd, src);
             forge__say(is_cxx ? "CXX" : "CC", src);
-            if (!forge__exec(&cmd))
+            if (!forge__runjob(&cmd))
                 return 0;
         }
         forge__add1(&objs, obj);
@@ -985,7 +1605,7 @@ static int forge__build(ForgeTarget *t)
         for (i = 0; i < objs.count; i++)
             forge__add1(&cmd, objs.items[i]);
         forge__say("AR", out);
-        return forge__exec(&cmd);
+        return forge__runjob(&cmd);
     }
 
     forge__add1(&cmd, forge__ccbin(cxx));
@@ -1017,7 +1637,7 @@ static int forge__build(ForgeTarget *t)
         forge__add1(&cmd, s);
     }
     forge__say(t->kind == FORGE_KIND_DLL ? "DLL" : "LD", out);
-    return forge__exec(&cmd);
+    return forge__runjob(&cmd);
 }
 
 static int forge__need(ForgeTarget *t)
@@ -1048,13 +1668,24 @@ static int forge__need(ForgeTarget *t)
 
 int forge__run(void)
 {
-    int i;
+    int i, tot = 0, ok = 1;
     if (forge__err)
         return 0;
-    for (i = 0; i < forge__ntargets; i++)
-        if (!forge__need(&forge__targets[i]))
+    for (i = 0; i < forge__ntargets; i++) {
+        int n = forge__jobs(&forge__targets[i]);
+        if (n < 0)
             return 0;
-    return 1;
+        tot += n;
+    }
+    forge__bar_begin(tot);
+    for (i = 0; i < forge__ntargets; i++) {
+        if (!forge__need(&forge__targets[i])) {
+            ok = 0;
+            break;
+        }
+    }
+    forge__bar_off();
+    return ok;
 }
 
 static int forge__ends_iexe(const char *s)

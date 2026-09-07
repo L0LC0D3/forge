@@ -23,12 +23,12 @@ FORGE_MAIN {
     }
 
     FORGE_LIB(foo) {
-        FORGE_SRC("lib/foo.c");
+        FORGE_SRC("lib/*.c");
         FORGE_INC("include");
     }
 
     FORGE_EXE(hello) {
-        FORGE_SRC("src/hello.c", "src/util.c");
+        FORGE_SRC("src/*.c", "src/**/*.cpp");
         FORGE_USE(foo);
         FORGE_USE(sdl2);
         FORGE_LIBS("m");
