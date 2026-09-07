@@ -48,6 +48,7 @@ cc -o build build.c
 ./build --rebuild
 ./build --clean
 ./build --verbose
+./build -j 8
 ```
 
 MSVC: `cl build.c`

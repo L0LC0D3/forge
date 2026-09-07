@@ -154,6 +154,7 @@ ForgeTarget *forge__end(ForgeTarget *t);
 void forge__add(ForgeStrs *s, ...);
 void forge__add_src(ForgeStrs *s, ...);
 void forge__pkg(const char *name);
+void forge__set_jobs(int n);
 
 #define FORGE_ON_WINDOWS  if (forge_os() == FORGE_OS_WINDOWS)
 #define FORGE_ON_POSIX    if (forge_os() != FORGE_OS_WINDOWS)
@@ -188,6 +189,7 @@ void forge__pkg(const char *name);
 #define FORGE_DEBUG()          (forge__cur()->debug = 1)
 #define FORGE_WARN()           (forge__cur()->warn = 1)
 #define FORGE_PIC()            (forge__cur()->pic = 1)
+#define FORGE_JOBS(n)          forge__set_jobs(n)
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define FORGE__UNUSED __attribute__((unused))
@@ -241,6 +243,8 @@ void forge__pkg(const char *name);
 #  include <unistd.h>
 #  include <dirent.h>
 #  include <sys/ioctl.h>
+#  include <fcntl.h>
+#  include <sys/select.h>
 #  define forge__popen  popen
 #  define forge__pclose pclose
 #endif
@@ -254,11 +258,19 @@ static int          forge__err;
 static int          forge__bar_on;
 static int          forge__bar_tot;
 static int          forge__bar_done;
-static const char  *forge__bar_name;
+static const char  *forge__bar_tn[16];
+static int          forge__bar_tr[16];
+static int          forge__bar_tnc;
+static int          forge__bar_live;
 static int          forge__verbose;
+static int          forge__njobs;
+static int          forge__def_jobs;
+static int          forge__jobs_cli;
 
 static void forge__errf(const char *fmt, ...);
 static int  forge__exec(ForgeStrs *cmd, int capture);
+static void forge__bar_draw(void);
+static void forge__clear_color(void);
 
 static void forge__oom(void)
 {
@@ -350,6 +362,39 @@ void forge__init(void)
     forge__def.opt = -1;
     forge__def.outdir = ".";
     forge__now = &forge__def;
+}
+
+void forge__set_jobs(int n)
+{
+    forge__def_jobs = n < 1 ? 1 : n;
+}
+
+static int forge__nproc(void)
+{
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    if (si.dwNumberOfProcessors < 1)
+        return 1;
+    return (int)si.dwNumberOfProcessors;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n < 1 ? 1 : (int)n;
+#endif
+}
+
+static void forge__resolve_jobs(void)
+{
+    if (forge__jobs_cli > 0)
+        forge__njobs = forge__jobs_cli;
+    else if (forge__jobs_cli < 0)
+        forge__njobs = forge__nproc();
+    else if (forge__def_jobs > 0)
+        forge__njobs = forge__def_jobs;
+    else
+        forge__njobs = forge__nproc();
+    if (forge__njobs < 1)
+        forge__njobs = 1;
 }
 
 ForgeTarget *forge__begin(int kind, const char *name)
@@ -1241,18 +1286,79 @@ static void forge__bar_off(void)
     forge__bar_on = 0;
 }
 
+static void forge__bar_push(const char *name)
+{
+    int i;
+    if (!name || !name[0])
+        return;
+    for (i = 0; i < forge__bar_tnc; i++) {
+        if (strcmp(forge__bar_tn[i], name) == 0) {
+            forge__bar_tr[i]++;
+            forge__bar_draw();
+            return;
+        }
+    }
+    if (forge__bar_tnc < (int)(sizeof(forge__bar_tn) / sizeof(forge__bar_tn[0]))) {
+        forge__bar_tn[forge__bar_tnc] = name;
+        forge__bar_tr[forge__bar_tnc] = 1;
+        forge__bar_tnc++;
+    }
+    forge__bar_draw();
+}
+
+static void forge__bar_pop(const char *name)
+{
+    int i, j;
+    if (!name)
+        return;
+    for (i = 0; i < forge__bar_tnc; i++) {
+        if (strcmp(forge__bar_tn[i], name) == 0) {
+            if (--forge__bar_tr[i] > 0) {
+                forge__bar_draw();
+                return;
+            }
+            for (j = i + 1; j < forge__bar_tnc; j++) {
+                forge__bar_tn[j - 1] = forge__bar_tn[j];
+                forge__bar_tr[j - 1] = forge__bar_tr[j];
+            }
+            forge__bar_tnc--;
+            forge__bar_draw();
+            return;
+        }
+    }
+}
+
+static void forge__bar_names(char *dst, int cap)
+{
+    int i, n = 0;
+    if (cap < 1)
+        return;
+    dst[0] = '\0';
+    for (i = 0; i < forge__bar_tnc; i++) {
+        int k = (int)strlen(forge__bar_tn[i]);
+        if (n && n + 1 < cap) {
+            dst[n++] = ' ';
+            dst[n] = '\0';
+        }
+        if (n + k >= cap)
+            break;
+        memcpy(dst + n, forge__bar_tn[i], (size_t)k);
+        n += k;
+        dst[n] = '\0';
+    }
+}
+
 static void forge__bar_draw(void)
 {
-    char bar[48], line[512];
+    char bar[48], line[512], names[256];
     int cols, inner = 20, fill, i, n, cur;
-    const char *name;
 
     if (!forge__bar_on)
         return;
     cols = forge__cols();
     if (cols > 500)
         cols = 500;
-    cur = forge__bar_name ? forge__bar_done + 1 : forge__bar_done;
+    cur = forge__bar_done + forge__bar_live;
     if (cur > forge__bar_tot)
         cur = forge__bar_tot;
     fill = forge__bar_tot ? (inner * cur) / forge__bar_tot : 0;
@@ -1269,10 +1375,10 @@ static void forge__bar_draw(void)
             bar[i] = ' ';
     }
     bar[inner] = '\0';
-    name = forge__bar_name ? forge__bar_name : "";
-    if (name[0])
+    forge__bar_names(names, (int)sizeof(names));
+    if (names[0])
         n = snprintf(line, sizeof(line), "  [%s] %d/%d    %s",
-                bar, cur, forge__bar_tot, name);
+                bar, cur, forge__bar_tot, names);
     else
         n = snprintf(line, sizeof(line), "  [%s] %d/%d",
                 bar, cur, forge__bar_tot);
@@ -1289,7 +1395,8 @@ static void forge__bar_begin(int tot)
     static int once;
     forge__bar_tot = tot;
     forge__bar_done = 0;
-    forge__bar_name = NULL;
+    forge__bar_tnc = 0;
+    forge__bar_live = 0;
     forge__bar_on = tot > 0 && forge__tty() && !forge__verbose;
     if (!forge__bar_on)
         return;
@@ -1315,17 +1422,6 @@ static void forge__printcmd(ForgeStrs *cmd)
     fputc('\n', stderr);
     if (forge__bar_on)
         forge__bar_draw();
-}
-
-static int forge__runjob(ForgeStrs *cmd)
-{
-    if (forge__verbose)
-        forge__printcmd(cmd);
-    if (!forge__exec(cmd, 1))
-        return 0;
-    if (forge__bar_on)
-        forge__bar_done++;
-    return 1;
 }
 
 static void forge__say(const char *tag, const char *path)
@@ -1442,21 +1538,89 @@ static void forge__emit_child(const char *buf, int n, int ok)
     free(out);
 }
 
-static int forge__exec(ForgeStrs *cmd, int capture)
+typedef struct ForgeSlot {
+#ifdef _WIN32
+    HANDLE proc, th, rd;
+#else
+    pid_t pid;
+    int fd;
+#endif
+    int used, ok;
+    char *obuf;
+    int on, ocap;
+    ForgeStrs cmd;
+    const char *tname;
+    int job;
+} ForgeSlot;
+
+static void forge__slot_clear(ForgeSlot *s)
 {
-    char *obuf = NULL;
-    int on = 0, ocap = 0, ok;
+#ifdef _WIN32
+    s->proc = NULL;
+    s->th = NULL;
+    s->rd = NULL;
+#else
+    s->pid = 0;
+    s->fd = -1;
+#endif
+    s->used = 0;
+    s->ok = 0;
+    s->obuf = NULL;
+    s->on = 0;
+    s->ocap = 0;
+    s->cmd.items = NULL;
+    s->cmd.count = 0;
+    s->cmd.cap = 0;
+    s->tname = NULL;
+    s->job = -1;
+}
+
+static void forge__drain(ForgeSlot *s)
+{
+    char tmp[4096];
+#ifdef _WIN32
+    DWORD avail, got;
+    if (!s->rd)
+        return;
+    for (;;) {
+        avail = 0;
+        if (!PeekNamedPipe(s->rd, NULL, 0, NULL, &avail, NULL) || avail == 0)
+            break;
+        got = 0;
+        if (!ReadFile(s->rd, tmp, sizeof(tmp), &got, NULL) || got == 0)
+            break;
+        forge__buf_add(&s->obuf, &s->on, &s->ocap, tmp, (int)got);
+    }
+#else
+    ssize_t r;
+    if (s->fd < 0)
+        return;
+    for (;;) {
+        r = read(s->fd, tmp, sizeof(tmp));
+        if (r > 0) {
+            forge__buf_add(&s->obuf, &s->on, &s->ocap, tmp, (int)r);
+            continue;
+        }
+        if (r < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        break;
+    }
+#endif
+}
+
+static int forge__spawn(ForgeStrs *cmd, ForgeSlot *s, int capture)
+{
     if (cmd->count < 1) {
         forge__errf("empty command");
         return 0;
     }
+    forge__slot_clear(s);
 #ifdef _WIN32
     {
         STARTUPINFOA si;
         PROCESS_INFORMATION pi;
         char *line = forge__cmdline(cmd);
-        DWORD code = 1;
-        HANDLE rd = NULL, wr = NULL;
+        HANDLE wr = NULL;
         memset(&si, 0, sizeof(si));
         memset(&pi, 0, sizeof(pi));
         si.cb = sizeof(si);
@@ -1465,12 +1629,12 @@ static int forge__exec(ForgeStrs *cmd, int capture)
             sa.nLength = sizeof(sa);
             sa.lpSecurityDescriptor = NULL;
             sa.bInheritHandle = TRUE;
-            if (!CreatePipe(&rd, &wr, &sa, 0)) {
+            if (!CreatePipe(&s->rd, &wr, &sa, 0)) {
                 forge__errf("CreatePipe failed (%lu)", (unsigned long)GetLastError());
                 free(line);
                 return 0;
             }
-            SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+            SetHandleInformation(s->rd, HANDLE_FLAG_INHERIT, 0);
             si.dwFlags |= STARTF_USESTDHANDLES;
             si.hStdInput = INVALID_HANDLE_VALUE;
             si.hStdOutput = wr;
@@ -1479,43 +1643,26 @@ static int forge__exec(ForgeStrs *cmd, int capture)
         if (!CreateProcessA(NULL, line, NULL, NULL, capture ? TRUE : FALSE,
                 0, NULL, NULL, &si, &pi)) {
             forge__errf("CreateProcess failed (%lu)", (unsigned long)GetLastError());
-            if (rd)
-                CloseHandle(rd);
+            if (s->rd)
+                CloseHandle(s->rd);
             if (wr)
                 CloseHandle(wr);
             free(line);
+            s->rd = NULL;
             return 0;
         }
         free(line);
         if (wr)
             CloseHandle(wr);
-        if (rd) {
-            char tmp[4096];
-            DWORD got;
-            for (;;) {
-                if (!ReadFile(rd, tmp, sizeof(tmp), &got, NULL) || got == 0)
-                    break;
-                forge__buf_add(&obuf, &on, &ocap, tmp, (int)got);
-            }
-            CloseHandle(rd);
-        }
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        GetExitCodeProcess(pi.hProcess, &code);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        ok = code == 0;
-        if (capture)
-            forge__emit_child(obuf, on, ok);
-        free(obuf);
-        if (!ok)
-            forge__cmdfail(cmd);
-        return ok;
+        s->proc = pi.hProcess;
+        s->th = pi.hThread;
+        s->used = 1;
+        return 1;
     }
 #else
     {
-        pid_t pid;
         int fds[2] = { -1, -1 };
-        int st = 0;
+        pid_t pid;
         if (capture && pipe(fds) != 0) {
             forge__errf("pipe: %s", strerror(errno));
             return 0;
@@ -1547,35 +1694,176 @@ static int forge__exec(ForgeStrs *cmd, int capture)
             _exit(127);
         }
         if (capture) {
-            char tmp[4096];
-            ssize_t r;
             close(fds[1]);
-            for (;;) {
-                r = read(fds[0], tmp, sizeof(tmp));
-                if (r < 0 && errno == EINTR)
-                    continue;
-                if (r <= 0)
-                    break;
-                forge__buf_add(&obuf, &on, &ocap, tmp, (int)r);
-            }
-            close(fds[0]);
+            fcntl(fds[0], F_SETFL, O_NONBLOCK);
+            s->fd = fds[0];
         }
-        if (waitpid(pid, &st, 0) < 0) {
-            forge__errf("waitpid: %s", strerror(errno));
-            free(obuf);
-            return 0;
-        }
-        ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
-        if (capture)
-            forge__emit_child(obuf, on, ok);
-        free(obuf);
-        if (!ok) {
-            forge__cmdfail(cmd);
-            return 0;
-        }
+        s->pid = pid;
+        s->used = 1;
         return 1;
     }
 #endif
+}
+
+static int forge__slot_reap(ForgeSlot *s)
+{
+#ifdef _WIN32
+    DWORD code = 1;
+    forge__drain(s);
+    if (s->rd) {
+        char tmp[4096];
+        DWORD got;
+        for (;;) {
+            if (!ReadFile(s->rd, tmp, sizeof(tmp), &got, NULL) || got == 0)
+                break;
+            forge__buf_add(&s->obuf, &s->on, &s->ocap, tmp, (int)got);
+        }
+        CloseHandle(s->rd);
+        s->rd = NULL;
+    }
+    if (s->proc) {
+        WaitForSingleObject(s->proc, INFINITE);
+        GetExitCodeProcess(s->proc, &code);
+        CloseHandle(s->proc);
+        s->proc = NULL;
+    }
+    if (s->th) {
+        CloseHandle(s->th);
+        s->th = NULL;
+    }
+    s->ok = code == 0;
+#else
+    int st = 0;
+    forge__drain(s);
+    if (s->fd >= 0) {
+        int fl = fcntl(s->fd, F_GETFL, 0);
+        if (fl >= 0)
+            fcntl(s->fd, F_SETFL, fl & ~O_NONBLOCK);
+        forge__drain(s);
+        close(s->fd);
+        s->fd = -1;
+    }
+    if (s->pid > 0) {
+        if (waitpid(s->pid, &st, 0) < 0) {
+            forge__errf("waitpid: %s", strerror(errno));
+            s->ok = 0;
+            s->pid = 0;
+            s->used = 0;
+            forge__emit_child(s->obuf, s->on, 0);
+            free(s->obuf);
+            s->obuf = NULL;
+            return 0;
+        }
+        s->ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        s->pid = 0;
+    }
+#endif
+    forge__emit_child(s->obuf, s->on, s->ok);
+    if (!s->ok)
+        forge__cmdfail(&s->cmd);
+    free(s->obuf);
+    s->obuf = NULL;
+    s->used = 0;
+    return 1;
+}
+
+static int forge__waitany(ForgeSlot *slots, int n, int *idx)
+{
+    int i;
+#ifdef _WIN32
+    HANDLE hs[64];
+    int map[64], m = 0;
+    DWORD wr;
+    for (i = 0; i < n; i++) {
+        if (slots[i].used)
+            forge__drain(&slots[i]);
+    }
+    for (i = 0; i < n; i++) {
+        if (!slots[i].used || !slots[i].proc)
+            continue;
+        hs[m] = slots[i].proc;
+        map[m] = i;
+        m++;
+    }
+    if (m < 1)
+        return -1;
+    wr = WaitForMultipleObjects((DWORD)m, hs, FALSE, 50);
+    if (wr == WAIT_TIMEOUT)
+        return 0;
+    if (wr >= WAIT_OBJECT_0 && wr < WAIT_OBJECT_0 + (DWORD)m) {
+        *idx = map[(int)(wr - WAIT_OBJECT_0)];
+        return forge__slot_reap(&slots[*idx]) ? 1 : -1;
+    }
+    forge__errf("WaitForMultipleObjects failed (%lu)", (unsigned long)GetLastError());
+    return -1;
+#else
+    pid_t pid;
+    int st = 0;
+    fd_set rf;
+    int maxfd = -1;
+    struct timeval tv;
+    for (i = 0; i < n; i++) {
+        if (slots[i].used)
+            forge__drain(&slots[i]);
+    }
+    pid = waitpid(-1, &st, WNOHANG);
+    if (pid < 0) {
+        forge__errf("waitpid: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        FD_ZERO(&rf);
+        for (i = 0; i < n; i++) {
+            if (!slots[i].used || slots[i].fd < 0)
+                continue;
+            FD_SET(slots[i].fd, &rf);
+            if (slots[i].fd > maxfd)
+                maxfd = slots[i].fd;
+        }
+        tv.tv_sec = 0;
+        tv.tv_usec = 50000;
+        if (maxfd >= 0)
+            select(maxfd + 1, &rf, NULL, NULL, &tv);
+        else {
+            tv.tv_sec = 0;
+            tv.tv_usec = 50000;
+            select(0, NULL, NULL, NULL, &tv);
+        }
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (slots[i].used && slots[i].pid == pid) {
+            *idx = i;
+            slots[i].ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+            slots[i].pid = 0;
+            forge__drain(&slots[i]);
+            if (slots[i].fd >= 0) {
+                close(slots[i].fd);
+                slots[i].fd = -1;
+            }
+            forge__emit_child(slots[i].obuf, slots[i].on, slots[i].ok);
+            if (!slots[i].ok)
+                forge__cmdfail(&slots[i].cmd);
+            free(slots[i].obuf);
+            slots[i].obuf = NULL;
+            slots[i].used = 0;
+            return 1;
+        }
+    }
+    return 0;
+#endif
+}
+
+static int forge__exec(ForgeStrs *cmd, int capture)
+{
+    ForgeSlot s;
+    forge__slot_clear(&s);
+    if (!forge__spawn(cmd, &s, capture))
+        return 0;
+    forge__strs_copy(&s.cmd, cmd);
+    if (!forge__slot_reap(&s))
+        return 0;
+    return s.ok;
 }
 
 static ForgeTarget *forge__find(const char *name)
@@ -1739,6 +2027,8 @@ static void forge__emit_compile(ForgeStrs *cmd, ForgeTarget *t)
     }
     if (t->debug)
         forge__add1(cmd, msvc ? "/Zi" : "-g");
+    if (msvc && t->debug && forge__njobs > 1)
+        forge__add1(cmd, "/FS");
     if (t->warn) {
         if (msvc) {
             forge__add1(cmd, "/W4");
@@ -1772,165 +2062,169 @@ static void forge__emit_lib(ForgeStrs *cmd, const char *lib)
         forge__add1(cmd, forge__fmt("-l%s", lib));
 }
 
-static int forge__jobs(ForgeTarget *t)
-{
-    ForgeTarget acc;
-    ForgeStrs arts = {0}, seen = {0}, objs = {0}, inputs = {0};
-    int i, n = 0, need;
-    const char *out;
-    char *objdir;
+enum {
+    FORGE_J_CC,
+    FORGE_J_AR,
+    FORGE_J_LD
+};
 
-    if (t->kind == FORGE_KIND_IMPORT || t->srcs.count < 1)
-        return 0;
-    objdir = forge__fmt("%s/%s", t->outdir, t->name);
-    for (i = 0; i < t->srcs.count; i++) {
-        const char *src = t->srcs.items[i];
-        const char *obj = forge__obj(objdir, src);
-        need = forge__needs(obj, &src, 1);
-        if (need < 0)
-            return -1;
-        if (need)
-            n++;
-        forge__add1(&objs, obj);
+typedef struct ForgeJob {
+    int kind;
+    ForgeTarget *t;
+    const char *src;
+    const char *obj;
+    int cxx;
+    int wait;
+    int *kids;
+    int nk, kcap;
+} ForgeJob;
+
+static int forge__job_add(ForgeJob **jobs, int *n, int *cap, ForgeJob *src)
+{
+    if (*n >= *cap) {
+        *cap = *cap ? *cap * 2 : 32;
+        *jobs = (ForgeJob *)realloc(*jobs, (size_t)*cap * sizeof(ForgeJob));
+        if (!*jobs)
+            forge__oom();
     }
-    memset(&acc, 0, sizeof(acc));
-    forge__gather(t, &acc, &arts, &seen);
-    out = forge__out(t);
-    for (i = 0; i < objs.count; i++)
-        forge__add1(&inputs, objs.items[i]);
-    for (i = 0; i < arts.count; i++)
-        forge__add1(&inputs, arts.items[i]);
-    need = forge__needsx(out, inputs.items, inputs.count, 0);
-    if (need < 0)
-        return -1;
-    if (need)
-        n++;
-    return n;
+    (*jobs)[*n] = *src;
+    return (*n)++;
 }
 
-static int forge__build(ForgeTarget *t)
+static void forge__job_edge(ForgeJob *jobs, int from, int to)
+{
+    ForgeJob *a = &jobs[from];
+    if (a->nk >= a->kcap) {
+        a->kcap = a->kcap ? a->kcap * 2 : 4;
+        a->kids = (int *)realloc(a->kids, (size_t)a->kcap * sizeof(int));
+        if (!a->kids)
+            forge__oom();
+    }
+    a->kids[a->nk++] = to;
+    jobs[to].wait++;
+}
+
+static void forge__acc_of(ForgeTarget *t, ForgeTarget *acc, ForgeStrs *arts)
+{
+    ForgeStrs seen = {0};
+    memset(acc, 0, sizeof(*acc));
+    acc->kind = t->kind;
+    acc->outdir = t->outdir;
+    acc->name = t->name;
+    acc->std = t->std;
+    acc->opt = t->opt;
+    acc->debug = t->debug;
+    acc->warn = t->warn;
+    acc->pic = t->pic;
+    forge__merge(acc, t);
+    forge__gather(t, acc, arts, &seen);
+}
+
+static void forge__cmd_cc(ForgeJob *j, ForgeStrs *cmd)
 {
     ForgeTarget acc;
-    ForgeStrs arts = {0}, seen = {0}, objs = {0}, inputs = {0}, cmd = {0};
-    int i, cxx = 0, need;
-    const char *out;
-    char *objdir;
-
-    if (t->srcs.count < 1) {
-        forge__errf("target `%s` has no sources", t->name);
-        return 0;
+    ForgeStrs arts = {0};
+    forge__acc_of(j->t, &acc, &arts);
+    cmd->count = 0;
+    forge__add1(cmd, forge__ccbin(j->cxx));
+    if (forge__msvc()) {
+        forge__add1(cmd, "/nologo");
+        forge__add1(cmd, "/c");
+        forge__add1(cmd, forge__fmt("/Fo%s", j->obj));
+    } else {
+        forge__add1(cmd, "-c");
+        forge__add1(cmd, "-o");
+        forge__add1(cmd, j->obj);
     }
-    forge__bar_name = t->name;
+    forge__emit_compile(cmd, &acc);
+    forge__add1(cmd, j->src);
+}
 
-    memset(&acc, 0, sizeof(acc));
-    acc.kind = t->kind;
-    acc.outdir = t->outdir;
-    acc.name = t->name;
-    acc.std = t->std;
-    acc.opt = t->opt;
-    acc.debug = t->debug;
-    acc.warn = t->warn;
-    acc.pic = t->pic;
-    forge__merge(&acc, t);
-    forge__gather(t, &acc, &arts, &seen);
-
-    if (!forge__mkdirs(t->outdir))
-        return 0;
-    objdir = forge__fmt("%s/%s", t->outdir, t->name);
-    if (!forge__mkdirs(objdir))
-        return 0;
-
+static void forge__cmd_link(ForgeJob *j, ForgeStrs *cmd)
+{
+    ForgeTarget acc, *t = j->t;
+    ForgeStrs arts = {0};
+    char *objdir = forge__fmt("%s/%s", t->outdir, t->name);
+    const char *out = forge__out(t);
+    int i, cxx = 0;
+    forge__acc_of(t, &acc, &arts);
     for (i = 0; i < t->srcs.count; i++) {
-        const char *src = t->srcs.items[i];
-        const char *obj = forge__obj(objdir, src);
-        int is_cxx = forge__cxx(src);
-        if (is_cxx)
+        if (forge__cxx(t->srcs.items[i]))
             cxx = 1;
-        need = forge__needs(obj, &src, 1);
-        if (need < 0)
-            return 0;
-        if (need) {
-            cmd.count = 0;
-            forge__add1(&cmd, forge__ccbin(is_cxx));
-            if (forge__msvc()) {
-                forge__add1(&cmd, "/nologo");
-                forge__add1(&cmd, "/c");
-                forge__add1(&cmd, forge__fmt("/Fo%s", obj));
-            } else {
-                forge__add1(&cmd, "-c");
-                forge__add1(&cmd, "-o");
-                forge__add1(&cmd, obj);
-            }
-            forge__emit_compile(&cmd, &acc);
-            forge__add1(&cmd, src);
-            forge__say(is_cxx ? "CXX" : "CC", src);
-            if (!forge__runjob(&cmd))
-                return 0;
-        }
-        forge__add1(&objs, obj);
     }
-
-    out = forge__out(t);
-    for (i = 0; i < objs.count; i++)
-        forge__add1(&inputs, objs.items[i]);
-    for (i = 0; i < arts.count; i++)
-        forge__add1(&inputs, arts.items[i]);
-    need = forge__needs(out, inputs.items, inputs.count);
-    if (need < 0)
-        return 0;
-    if (!need)
-        return 1;
-
-    cmd.count = 0;
+    cmd->count = 0;
     if (t->kind == FORGE_KIND_LIB) {
         if (forge__msvc()) {
-            forge__add1(&cmd, "lib.exe");
-            forge__add1(&cmd, "/nologo");
-            forge__add1(&cmd, forge__fmt("/OUT:%s", out));
+            forge__add1(cmd, "lib.exe");
+            forge__add1(cmd, "/nologo");
+            forge__add1(cmd, forge__fmt("/OUT:%s", out));
         } else {
-            forge__add1(&cmd, "ar");
-            forge__add1(&cmd, "rcs");
-            forge__add1(&cmd, out);
+            forge__add1(cmd, "ar");
+            forge__add1(cmd, "rcs");
+            forge__add1(cmd, out);
         }
-        for (i = 0; i < objs.count; i++)
-            forge__add1(&cmd, objs.items[i]);
-        forge__say("AR", out);
-        return forge__runjob(&cmd);
+        for (i = 0; i < t->srcs.count; i++)
+            forge__add1(cmd, forge__obj(objdir, t->srcs.items[i]));
+        return;
     }
-
-    forge__add1(&cmd, forge__ccbin(cxx));
+    forge__add1(cmd, forge__ccbin(cxx));
     if (forge__msvc()) {
-        forge__add1(&cmd, "/nologo");
+        forge__add1(cmd, "/nologo");
         if (t->kind == FORGE_KIND_DLL)
-            forge__add1(&cmd, "/LD");
-        forge__add1(&cmd, forge__fmt("/Fe%s", out));
+            forge__add1(cmd, "/LD");
+        forge__add1(cmd, forge__fmt("/Fe%s", out));
     } else {
         if (t->kind == FORGE_KIND_DLL)
-            forge__add1(&cmd, "-shared");
-        forge__add1(&cmd, "-o");
-        forge__add1(&cmd, out);
+            forge__add1(cmd, "-shared");
+        forge__add1(cmd, "-o");
+        forge__add1(cmd, out);
     }
-    for (i = 0; i < objs.count; i++)
-        forge__add1(&cmd, objs.items[i]);
+    for (i = 0; i < t->srcs.count; i++)
+        forge__add1(cmd, forge__obj(objdir, t->srcs.items[i]));
     for (i = 0; i < arts.count; i++)
-        forge__add1(&cmd, arts.items[i]);
+        forge__add1(cmd, arts.items[i]);
     if (forge__msvc() && acc.libdirs.count > 0)
-        forge__add1(&cmd, "/link");
+        forge__add1(cmd, "/link");
     for (i = 0; i < acc.libdirs.count; i++)
-        forge__add1(&cmd, forge__fmt(forge__msvc() ? "/LIBPATH:%s" : "-L%s", acc.libdirs.items[i]));
+        forge__add1(cmd, forge__fmt(forge__msvc() ? "/LIBPATH:%s" : "-L%s", acc.libdirs.items[i]));
     for (i = 0; i < acc.libs.count; i++)
-        forge__emit_lib(&cmd, acc.libs.items[i]);
+        forge__emit_lib(cmd, acc.libs.items[i]);
     for (i = 0; i < acc.pkg.count; i++) {
         const char *s = acc.pkg.items[i];
         if (forge__isincdef(s))
             continue;
-        forge__add1(&cmd, s);
+        forge__add1(cmd, s);
     }
-    forge__say(t->kind == FORGE_KIND_DLL ? "DLL" : "LD", out);
-    return forge__runjob(&cmd);
 }
 
-static int forge__need(ForgeTarget *t)
+static int forge__start_job(ForgeJob *j, ForgeSlot *s, int ji)
+{
+    ForgeStrs cmd = {0};
+    const char *tag, *path;
+    if (j->kind == FORGE_J_CC) {
+        forge__cmd_cc(j, &cmd);
+        tag = j->cxx ? "CXX" : "CC";
+        path = j->src;
+    } else {
+        forge__cmd_link(j, &cmd);
+        if (j->kind == FORGE_J_AR)
+            tag = "AR";
+        else
+            tag = j->t->kind == FORGE_KIND_DLL ? "DLL" : "LD";
+        path = forge__out(j->t);
+    }
+    forge__say(tag, path);
+    if (forge__verbose)
+        forge__printcmd(&cmd);
+    if (!forge__spawn(&cmd, s, 1))
+        return 0;
+    s->tname = j->t->name;
+    s->job = ji;
+    forge__strs_copy(&s->cmd, &cmd);
+    return 1;
+}
+
+static int forge__mark_need(ForgeTarget *t)
 {
     int i;
     if (t->color == 2)
@@ -1947,13 +2241,236 @@ static int forge__need(ForgeTarget *t)
                     t->uses.items[i], t->name);
             return 0;
         }
-        if (!forge__need(u))
+        if (!forge__mark_need(u))
             return 0;
     }
-    if (t->kind != FORGE_KIND_IMPORT && !forge__build(t))
-        return 0;
     t->color = 2;
     return 1;
+}
+
+static int forge__collect_target(ForgeTarget *t, ForgeJob **jobs, int *nj, int *cap, int *link_of)
+{
+    char *objdir;
+    ForgeStrs objs = {0}, arts = {0}, inputs = {0}, seen = {0};
+    ForgeTarget acc;
+    int i, need, cc0, ncc = 0, link, ti;
+    const char *out;
+
+    if (t->kind == FORGE_KIND_IMPORT)
+        return 1;
+    if (t->srcs.count < 1) {
+        forge__errf("target `%s` has no sources", t->name);
+        return 0;
+    }
+    if (!forge__mkdirs(t->outdir))
+        return 0;
+    objdir = forge__fmt("%s/%s", t->outdir, t->name);
+    if (!forge__mkdirs(objdir))
+        return 0;
+    ti = (int)(t - forge__targets);
+    cc0 = *nj;
+    for (i = 0; i < t->srcs.count; i++) {
+        const char *src = t->srcs.items[i];
+        const char *obj = forge__obj(objdir, src);
+        int is_cxx = forge__cxx(src);
+        need = forge__needs(obj, &src, 1);
+        if (need < 0)
+            return 0;
+        forge__add1(&objs, obj);
+        if (need) {
+            ForgeJob j;
+            memset(&j, 0, sizeof(j));
+            j.kind = FORGE_J_CC;
+            j.t = t;
+            j.src = src;
+            j.obj = obj;
+            j.cxx = is_cxx;
+            forge__job_add(jobs, nj, cap, &j);
+            ncc++;
+        }
+    }
+    memset(&acc, 0, sizeof(acc));
+    acc.kind = t->kind;
+    forge__merge(&acc, t);
+    forge__gather(t, &acc, &arts, &seen);
+    out = forge__out(t);
+    for (i = 0; i < objs.count; i++)
+        forge__add1(&inputs, objs.items[i]);
+    for (i = 0; i < arts.count; i++)
+        forge__add1(&inputs, arts.items[i]);
+    need = forge__needsx(out, inputs.items, inputs.count, 0);
+    if (need < 0)
+        return 0;
+    if (ncc > 0)
+        need = 1;
+    if (!need)
+        return 1;
+    {
+        ForgeJob j;
+        memset(&j, 0, sizeof(j));
+        j.kind = t->kind == FORGE_KIND_LIB ? FORGE_J_AR : FORGE_J_LD;
+        j.t = t;
+        link = forge__job_add(jobs, nj, cap, &j);
+        link_of[ti] = link;
+        for (i = 0; i < ncc; i++)
+            forge__job_edge(*jobs, cc0 + i, link);
+    }
+    return 1;
+}
+
+static int forge__collect_jobs(ForgeStrs *want, ForgeJob **jobs, int *nj)
+{
+    int *link_of, cap = 0, i, k;
+    *nj = 0;
+    *jobs = NULL;
+    link_of = (int *)malloc((size_t)forge__ntargets * sizeof(int));
+    if (!link_of)
+        forge__oom();
+    for (i = 0; i < forge__ntargets; i++)
+        link_of[i] = -1;
+    if (want && want->count > 0) {
+        for (i = 0; i < want->count; i++) {
+            if (!forge__mark_need(forge__find(want->items[i]))) {
+                free(link_of);
+                return 0;
+            }
+        }
+        for (i = 0; i < forge__ntargets; i++) {
+            if (forge__targets[i].color != 2)
+                continue;
+            if (!forge__collect_target(&forge__targets[i], jobs, nj, &cap, link_of)) {
+                free(link_of);
+                return 0;
+            }
+        }
+        forge__clear_color();
+    } else {
+        for (i = 0; i < forge__ntargets; i++) {
+            if (forge__targets[i].kind == FORGE_KIND_IMPORT)
+                continue;
+            if (!forge__mark_need(&forge__targets[i])) {
+                free(link_of);
+                return 0;
+            }
+        }
+        forge__clear_color();
+        for (i = 0; i < forge__ntargets; i++) {
+            if (!forge__collect_target(&forge__targets[i], jobs, nj, &cap, link_of)) {
+                free(link_of);
+                return 0;
+            }
+        }
+    }
+    for (i = 0; i < forge__ntargets; i++) {
+        ForgeTarget *t = &forge__targets[i];
+        if (link_of[i] < 0)
+            continue;
+        for (k = 0; k < t->uses.count; k++) {
+            ForgeTarget *u = forge__find(t->uses.items[k]);
+            int ui;
+            if (!u || u->kind == FORGE_KIND_IMPORT)
+                continue;
+            ui = (int)(u - forge__targets);
+            if (link_of[ui] >= 0)
+                forge__job_edge(*jobs, link_of[ui], link_of[i]);
+        }
+    }
+    free(link_of);
+    return 1;
+}
+
+static int forge__sched(ForgeJob *jobs, int nj)
+{
+    int *ready, nr = 0, rh = 0, i, live = 0, fail = 0, finished = 0, nslot;
+    ForgeSlot *slots;
+    if (nj < 1)
+        return 1;
+    nslot = forge__njobs;
+    if (nslot < 1)
+        nslot = 1;
+#ifdef _WIN32
+    if (nslot > 64)
+        nslot = 64;
+#endif
+    if (nslot > nj)
+        nslot = nj;
+    ready = (int *)malloc((size_t)nj * sizeof(int));
+    slots = (ForgeSlot *)calloc((size_t)nslot, sizeof(ForgeSlot));
+    if (!ready || !slots)
+        forge__oom();
+    for (i = 0; i < nslot; i++)
+        forge__slot_clear(&slots[i]);
+    for (i = 0; i < nj; i++) {
+        if (jobs[i].wait == 0)
+            ready[nr++] = i;
+    }
+    while (finished < nj) {
+        while (!fail && live < nslot && rh < nr) {
+            int ji = ready[rh], s;
+            for (s = 0; s < nslot; s++) {
+                if (!slots[s].used)
+                    break;
+            }
+            if (s == nslot)
+                break;
+            rh++;
+            if (!forge__start_job(&jobs[ji], &slots[s], ji)) {
+                fail = 1;
+                break;
+            }
+            live++;
+            forge__bar_live++;
+            forge__bar_push(jobs[ji].t->name);
+        }
+        if (live < 1) {
+            if (fail)
+                break;
+            forge__errf("job deadlock");
+            fail = 1;
+            break;
+        }
+        {
+            int idx = 0, r = forge__waitany(slots, nslot, &idx);
+            if (r < 0) {
+                fail = 1;
+                break;
+            }
+            if (r == 0)
+                continue;
+            forge__bar_pop(slots[idx].tname);
+            forge__bar_live--;
+            if (forge__bar_on)
+                forge__bar_done++;
+            finished++;
+            live--;
+            if (!slots[idx].ok)
+                fail = 1;
+            else if (!fail) {
+                int ji = slots[idx].job;
+                for (i = 0; i < jobs[ji].nk; i++) {
+                    int d = jobs[ji].kids[i];
+                    if (--jobs[d].wait == 0)
+                        ready[nr++] = d;
+                }
+            }
+        }
+    }
+    while (live > 0) {
+        int idx = 0, r = forge__waitany(slots, nslot, &idx);
+        if (r <= 0) {
+            if (r < 0)
+                break;
+            continue;
+        }
+        forge__bar_pop(slots[idx].tname);
+        forge__bar_live--;
+        if (forge__bar_on)
+            forge__bar_done++;
+        live--;
+    }
+    free(ready);
+    free(slots);
+    return !fail && finished == nj;
 }
 
 static int forge__outdir_ok(const char *p)
@@ -2062,38 +2579,6 @@ static int forge__clean_root(ForgeTarget *t)
     return 1;
 }
 
-static int forge__jobs_root(ForgeTarget *t)
-{
-    int i, n = 0, k;
-    if (t->color == 2)
-        return 0;
-    if (t->color == 1) {
-        forge__errf("cyclic FORGE_USE involving `%s`", t->name);
-        return -1;
-    }
-    t->color = 1;
-    for (i = 0; i < t->uses.count; i++) {
-        ForgeTarget *u = forge__find(t->uses.items[i]);
-        if (!u) {
-            forge__errf("unknown target `%s` (used by `%s`)",
-                    t->uses.items[i], t->name);
-            return -1;
-        }
-        k = forge__jobs_root(u);
-        if (k < 0)
-            return -1;
-        n += k;
-    }
-    if (t->kind != FORGE_KIND_IMPORT) {
-        k = forge__jobs(t);
-        if (k < 0)
-            return -1;
-        n += k;
-    }
-    t->color = 2;
-    return n;
-}
-
 static void forge__help(const char *argv0)
 {
     int i, n = 0;
@@ -2101,6 +2586,7 @@ static void forge__help(const char *argv0)
     printf("  --rebuild   delete outputs and rebuild\n");
     printf("  --clean     delete outputs\n");
     printf("  --verbose   print compiler commands\n");
+    printf("  -j, --jobs N  parallel jobs (default: nproc)\n");
     printf("  -h, --help  show this help\n");
     for (i = 0; i < forge__ntargets; i++) {
         if (forge__targets[i].kind != FORGE_KIND_IMPORT)
@@ -2115,12 +2601,32 @@ static void forge__help(const char *argv0)
     }
 }
 
+static int forge__parse_jobs(const char *s, int *out)
+{
+    int n = 0;
+    if (!s || !*s)
+        return 0;
+    while (*s) {
+        if (*s < '0' || *s > '9')
+            return 0;
+        n = n * 10 + (*s - '0');
+        if (n > 10000)
+            return 0;
+        s++;
+    }
+    if (n < 1)
+        return 0;
+    *out = n;
+    return 1;
+}
+
 static int forge__args(int argc, char **argv, int *rebuild, int *clean, ForgeStrs *want)
 {
     int i, rest = 0;
     *rebuild = 0;
     *clean = 0;
     forge__verbose = 0;
+    forge__jobs_cli = 0;
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!rest && strcmp(a, "--") == 0) {
@@ -2137,6 +2643,21 @@ static int forge__args(int argc, char **argv, int *rebuild, int *clean, ForgeStr
             else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
                 forge__help(argv[0]);
                 return 0;
+            } else if (strncmp(a, "--jobs=", 7) == 0) {
+                if (!forge__parse_jobs(a + 7, &forge__jobs_cli)) {
+                    forge__errf("invalid jobs `%s`", a + 7);
+                    return -1;
+                }
+            } else if (strcmp(a, "--jobs") == 0 || strcmp(a, "-j") == 0) {
+                if (i + 1 < argc && forge__parse_jobs(argv[i + 1], &forge__jobs_cli))
+                    i++;
+                else
+                    forge__jobs_cli = -1;
+            } else if (a[1] == 'j' && a[2] >= '0' && a[2] <= '9') {
+                if (!forge__parse_jobs(a + 2, &forge__jobs_cli)) {
+                    forge__errf("invalid jobs `%s`", a + 2);
+                    return -1;
+                }
             } else {
                 forge__errf("unknown option `%s`", a);
                 return -1;
@@ -2168,7 +2689,8 @@ static int forge__resolve(ForgeStrs *want)
 int forge__run(int argc, char **argv)
 {
     ForgeStrs want = {0};
-    int i, tot = 0, ok = 1, rebuild = 0, clean = 0, args;
+    ForgeJob *jobs = NULL;
+    int i, tot = 0, ok = 1, rebuild = 0, clean = 0, args, nj = 0;
     if (forge__err)
         return 0;
     args = forge__args(argc, argv, &rebuild, &clean, &want);
@@ -2176,6 +2698,7 @@ int forge__run(int argc, char **argv)
         return 0;
     if (args == 0)
         return 1;
+    forge__resolve_jobs();
     if (want.count > 0 && !forge__resolve(&want))
         return 0;
     if (clean || rebuild) {
@@ -2192,36 +2715,11 @@ int forge__run(int argc, char **argv)
     }
     if (clean && !rebuild)
         return 1;
-    if (want.count < 1) {
-        for (i = 0; i < forge__ntargets; i++) {
-            int n = forge__jobs(&forge__targets[i]);
-            if (n < 0)
-                return 0;
-            tot += n;
-        }
-        forge__bar_begin(tot);
-        for (i = 0; i < forge__ntargets; i++) {
-            if (!forge__need(&forge__targets[i])) {
-                ok = 0;
-                break;
-            }
-        }
-    } else {
-        for (i = 0; i < want.count; i++) {
-            int n = forge__jobs_root(forge__find(want.items[i]));
-            if (n < 0)
-                return 0;
-            tot += n;
-        }
-        forge__clear_color();
-        forge__bar_begin(tot);
-        for (i = 0; i < want.count; i++) {
-            if (!forge__need(forge__find(want.items[i]))) {
-                ok = 0;
-                break;
-            }
-        }
-    }
+    if (!forge__collect_jobs(&want, &jobs, &nj))
+        return 0;
+    tot = nj;
+    forge__bar_begin(tot);
+    ok = forge__sched(jobs, nj);
     forge__bar_off();
     return ok;
 }
