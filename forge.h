@@ -2046,6 +2046,11 @@ static ForgeTarget *forge__find(const char *name)
     return NULL;
 }
 
+static char *forge__objdir(ForgeTarget *t)
+{
+    return forge__fmt("%s/.obj/%s", t->outdir, t->name);
+}
+
 static const char *forge__out(ForgeTarget *t)
 {
     switch (t->kind) {
@@ -2387,7 +2392,7 @@ static void forge__cmd_link(ForgeJob *j, ForgeStrs *cmd)
 {
     ForgeTarget acc, *t = j->t;
     ForgeStrs arts = {0};
-    char *objdir = forge__fmt("%s/%s", t->outdir, t->name);
+    char *objdir = forge__objdir(t);
     const char *out = forge__out(t);
     int i, cxx = 0;
     forge__acc_of(t, &acc, &arts);
@@ -2604,7 +2609,7 @@ static int forge__collect_target(ForgeTarget *t, ForgeJob **jobs, int *nj, int *
     }
     if (!forge__mkdirs(t->outdir))
         return 0;
-    objdir = forge__fmt("%s/%s", t->outdir, t->name);
+    objdir = forge__objdir(t);
     if (!forge__mkdirs(objdir))
         return 0;
     ti = (int)(t - forge__targets);
@@ -2875,7 +2880,7 @@ static int forge__clean(void)
             lf = forge__linkfile(t);
             if (lf && (!out || strcmp(lf, out) != 0) && !forge__rm_rf(lf))
                 return 0;
-            if (!forge__rm_rf(forge__fmt("%s/%s", t->outdir, t->name)))
+            if (!forge__rm_rf(forge__objdir(t)))
                 return 0;
         }
     }
@@ -2909,7 +2914,7 @@ static int forge__clean_one(ForgeTarget *t)
     lf = forge__linkfile(t);
     if (lf && (!out || strcmp(lf, out) != 0) && !forge__rm_rf(lf))
         return 0;
-    return forge__rm_rf(forge__fmt("%s/%s", t->outdir, t->name));
+    return forge__rm_rf(forge__objdir(t));
 }
 
 static int forge__clean_root(ForgeTarget *t)
