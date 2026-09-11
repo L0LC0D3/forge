@@ -18,6 +18,8 @@
 #ifndef _FORGE_BUILD_SYSTEM_FOR_C_CXX_H_
 #define _FORGE_BUILD_SYSTEM_FOR_C_CXX_H_
 
+#include <stddef.h>
+
 #ifdef _WIN32
 #  ifndef _CRT_SECURE_NO_WARNINGS
 #    define _CRT_SECURE_NO_WARNINGS 1
@@ -228,6 +230,15 @@ void forge__set_jobs(int n);
 #ifdef FORGE_IMPLEMENTATION
 #ifndef FORGE__IMPL
 #define FORGE__IMPL
+
+#if !defined(_WIN32)
+#  if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#    define _DARWIN_C_SOURCE
+#  elif !defined(_DEFAULT_SOURCE) && !defined(_POSIX_C_SOURCE) && \
+        !defined(_GNU_SOURCE) && !defined(_BSD_SOURCE)
+#    define _DEFAULT_SOURCE 1
+#  endif
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2897,8 +2908,7 @@ static void forge__mark(void)
 #ifdef _WIN32
     SetEnvironmentVariableA("FORGE_REBUILT", "1");
 #else
-    static char e[] = "FORGE_REBUILT=1";
-    putenv(e);
+    setenv("FORGE_REBUILT", "1", 1);
 #endif
 }
 
