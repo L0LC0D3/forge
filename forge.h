@@ -67,8 +67,10 @@ enum {
     FORGE_KIND_LIB,
     FORGE_KIND_DLL,
     FORGE_KIND_CMD,
-    FORGE_KIND_IMPORT
+    FORGE_KIND_GROUP
 };
+
+#define FORGE_KIND_IMPORT FORGE_KIND_GROUP
 
 FORGE_INLINE int forge_os(void)
 {
@@ -188,10 +190,30 @@ void forge__set_jobs(int n);
     for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_LIB, #name); forge__t; forge__t = forge__end(forge__t))
 #define FORGE_DLL(name) \
     for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_DLL, #name); forge__t; forge__t = forge__end(forge__t))
-#define FORGE_IMPORT(name) \
-    for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_IMPORT, #name); forge__t; forge__t = forge__end(forge__t))
+#define FORGE_GROUP(name) \
+    for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_GROUP, #name); forge__t; forge__t = forge__end(forge__t))
+#define FORGE_IMPORT(name) FORGE_GROUP(name)
 #define FORGE_CMD(name) \
     for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_CMD, #name); forge__t; forge__t = forge__end(forge__t))
+/* FORGE_DEFAULT accepts at most 8 names per call; use multiple calls for more. */
+#define FORGE__STR(x) #x
+#define FORGE__DEFAULT_1(a) FORGE__STR(a)
+#define FORGE__DEFAULT_2(a,b) FORGE__STR(a), FORGE__STR(b)
+#define FORGE__DEFAULT_3(a,b,c) FORGE__STR(a), FORGE__STR(b), FORGE__STR(c)
+#define FORGE__DEFAULT_4(a,b,c,d) FORGE__STR(a), FORGE__STR(b), FORGE__STR(c), FORGE__STR(d)
+#define FORGE__DEFAULT_5(a,b,c,d,e) FORGE__STR(a), FORGE__STR(b), FORGE__STR(c), FORGE__STR(d), FORGE__STR(e)
+#define FORGE__DEFAULT_6(a,b,c,d,e,f) FORGE__STR(a), FORGE__STR(b), FORGE__STR(c), FORGE__STR(d), FORGE__STR(e), FORGE__STR(f)
+#define FORGE__DEFAULT_7(a,b,c,d,e,f,g) FORGE__STR(a), FORGE__STR(b), FORGE__STR(c), FORGE__STR(d), FORGE__STR(e), FORGE__STR(f), FORGE__STR(g)
+#define FORGE__DEFAULT_8(a,b,c,d,e,f,g,h) FORGE__STR(a), FORGE__STR(b), FORGE__STR(c), FORGE__STR(d), FORGE__STR(e), FORGE__STR(f), FORGE__STR(g), FORGE__STR(h)
+#define FORGE__DEFAULT_N(_1,_2,_3,_4,_5,_6,_7,_8,N,...) FORGE__DEFAULT_##N
+#define FORGE__DEFAULT_NARG(...) FORGE__DEFAULT_N(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define FORGE_DEFAULT(...) do { \
+    const char *forge__dn[] = { FORGE__DEFAULT_NARG(__VA_ARGS__)(__VA_ARGS__), NULL }; \
+    int forge__di; \
+    for (forge__di = 0; forge__dn[forge__di]; forge__di++) \
+        forge__add1(&forge__defaults, forge__dn[forge__di]); \
+} while (0)
+#define FORGE_RUN_GROUP(name) FORGE_DEFAULT(name)
 
 #define FORGE_SRC(...)         forge__add_src(&forge__cur()->srcs, __VA_ARGS__, NULL)
 #define FORGE_INC(...)         forge__add(&forge__cur()->incs, __VA_ARGS__, NULL)
@@ -309,8 +331,10 @@ static int          forge__verbose;
 static int          forge__njobs;
 static int          forge__def_jobs;
 static int          forge__jobs_cli;
+static ForgeStrs    forge__defaults;
 
 static void forge__errf(const char *fmt, ...);
+static void forge__warnf(const char *fmt, ...);
 static int  forge__exec(ForgeStrs *cmd, int capture);
 static void forge__bar_draw(void);
 static void forge__clear_color(void);
@@ -1588,6 +1612,21 @@ static void forge__errf(const char *fmt, ...)
     fprintf(stderr, "\n");
 }
 
+static void forge__warnf(const char *fmt, ...)
+{
+    va_list ap;
+    if (forge__bar_on)
+        forge__bar_off();
+    if (forge__color())
+        fprintf(stderr, "  \033[1;33mwarn\033[0m   ");
+    else
+        fprintf(stderr, "  warn   ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+}
+
 static void forge__cmdfail(ForgeStrs *cmd)
 {
     int i;
@@ -2053,6 +2092,11 @@ const char *forge_path(const char *name)
         forge__err = 1;
         return "";
     }
+    if (t->kind == FORGE_KIND_GROUP) {
+        forge__errf("target `%s` is a group", name);
+        forge__err = 1;
+        return "";
+    }
     if (t->kind == FORGE_KIND_CMD) {
         if (t->outs.count < 1) {
             forge__errf("target `%s` has no outs", name);
@@ -2077,6 +2121,11 @@ const char *forge_exe(const char *name)
     ForgeTarget *t = forge__find(name);
     if (!t) {
         forge__errf("unknown target `%s`", name);
+        forge__err = 1;
+        return "";
+    }
+    if (t->kind == FORGE_KIND_GROUP) {
+        forge__errf("target `%s` is a group", name);
         forge__err = 1;
         return "";
     }
@@ -2525,7 +2574,7 @@ static int forge__collect_target(ForgeTarget *t, ForgeJob **jobs, int *nj, int *
     int i, need, cc0, ncc = 0, link, ti;
     const char *out;
 
-    if (t->kind == FORGE_KIND_IMPORT)
+    if (t->kind == FORGE_KIND_GROUP)
         return 1;
     if (t->kind == FORGE_KIND_CMD) {
         ForgeStrs cmdin = {0};
@@ -2637,7 +2686,7 @@ static int forge__collect_jobs(ForgeStrs *want, ForgeJob **jobs, int *nj)
         forge__clear_color();
     } else {
         for (i = 0; i < forge__ntargets; i++) {
-            if (forge__targets[i].kind == FORGE_KIND_IMPORT)
+            if (forge__targets[i].kind == FORGE_KIND_GROUP)
                 continue;
             if (!forge__mark_need(&forge__targets[i])) {
                 free(link_of);
@@ -2659,7 +2708,7 @@ static int forge__collect_jobs(ForgeStrs *want, ForgeJob **jobs, int *nj)
         for (k = 0; k < t->uses.count; k++) {
             ForgeTarget *u = forge__find(t->uses.items[k]);
             int ui;
-            if (!u || u->kind == FORGE_KIND_IMPORT)
+            if (!u || u->kind == FORGE_KIND_GROUP)
                 continue;
             ui = (int)(u - forge__targets);
             if (link_of[ui] >= 0)
@@ -2792,7 +2841,7 @@ static int forge__clean(void)
     int i, j;
     for (i = 0; i < forge__ntargets; i++) {
         ForgeTarget *t = &forge__targets[i];
-        if (t->kind == FORGE_KIND_IMPORT)
+        if (t->kind == FORGE_KIND_GROUP)
             continue;
         if (!t->outdir || forge__has(&dirs, t->outdir))
             continue;
@@ -2810,7 +2859,7 @@ static int forge__clean(void)
             ForgeTarget *t = &forge__targets[j];
             const char *out, *lf;
             int k;
-            if (t->kind == FORGE_KIND_IMPORT || !t->outdir ||
+            if (t->kind == FORGE_KIND_GROUP || !t->outdir ||
                     strcmp(t->outdir, d) != 0)
                 continue;
             if (t->kind == FORGE_KIND_CMD) {
@@ -2844,7 +2893,7 @@ static int forge__clean_one(ForgeTarget *t)
 {
     const char *out, *lf;
     int i;
-    if (t->kind == FORGE_KIND_IMPORT)
+    if (t->kind == FORGE_KIND_GROUP)
         return 1;
     forge__say("CLEAN", t->name);
     if (t->kind == FORGE_KIND_CMD) {
@@ -2883,7 +2932,7 @@ static int forge__clean_root(ForgeTarget *t)
         if (!forge__clean_root(u))
             return 0;
     }
-    if (t->kind != FORGE_KIND_IMPORT && !forge__clean_one(t))
+    if (t->kind != FORGE_KIND_GROUP && !forge__clean_one(t))
         return 0;
     t->color = 2;
     return 1;
@@ -2891,7 +2940,7 @@ static int forge__clean_root(ForgeTarget *t)
 
 static void forge__help(const char *argv0)
 {
-    int i, n = 0;
+    int i, ng = 0, nt = 0;
     printf("Usage: %s [option]... [target]...\n", forge__base(argv0));
     printf("  --rebuild   delete outputs and rebuild\n");
     printf("  --clean     delete outputs\n");
@@ -2899,13 +2948,22 @@ static void forge__help(const char *argv0)
     printf("  -j, --jobs N  parallel jobs (default: nproc)\n");
     printf("  -h, --help  show this help\n");
     for (i = 0; i < forge__ntargets; i++) {
-        if (forge__targets[i].kind != FORGE_KIND_IMPORT)
-            n++;
+        if (forge__targets[i].kind == FORGE_KIND_GROUP)
+            ng++;
+        else
+            nt++;
     }
-    if (n) {
+    if (ng) {
+        printf("\nGroups:\n");
+        for (i = 0; i < forge__ntargets; i++) {
+            if (forge__targets[i].kind == FORGE_KIND_GROUP)
+                printf("  %s\n", forge__targets[i].name);
+        }
+    }
+    if (nt) {
         printf("\nTargets:\n");
         for (i = 0; i < forge__ntargets; i++) {
-            if (forge__targets[i].kind != FORGE_KIND_IMPORT)
+            if (forge__targets[i].kind != FORGE_KIND_GROUP)
                 printf("  %s\n", forge__targets[i].name);
         }
     }
@@ -2983,17 +3041,22 @@ static int forge__resolve(ForgeStrs *want)
 {
     int i;
     for (i = 0; i < want->count; i++) {
-        ForgeTarget *t = forge__find(want->items[i]);
-        if (!t) {
+        if (!forge__find(want->items[i])) {
             forge__errf("unknown target `%s`", want->items[i]);
-            return 0;
-        }
-        if (t->kind == FORGE_KIND_IMPORT) {
-            forge__errf("target `%s` is an import", t->name);
             return 0;
         }
     }
     return 1;
+}
+
+static void forge__warn_empty_defaults(void)
+{
+    int i;
+    for (i = 0; i < forge__defaults.count; i++) {
+        ForgeTarget *t = forge__find(forge__defaults.items[i]);
+        if (t && t->kind == FORGE_KIND_GROUP && t->uses.count < 1)
+            forge__warnf("default group `%s` has no members", t->name);
+    }
 }
 
 int forge__run(int argc, char **argv)
@@ -3008,6 +3071,11 @@ int forge__run(int argc, char **argv)
         return 0;
     if (args == 0)
         return 1;
+    if (want.count == 0 && forge__defaults.count > 0) {
+        for (i = 0; i < forge__defaults.count; i++)
+            forge__add1(&want, forge__defaults.items[i]);
+        forge__warn_empty_defaults();
+    }
     forge__resolve_jobs();
     if (want.count > 0 && !forge__resolve(&want))
         return 0;

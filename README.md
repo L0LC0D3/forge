@@ -13,7 +13,7 @@ FORGE_MAIN {
     FORGE_STD(c99);
     FORGE_WARN();
 
-    FORGE_IMPORT(sdl2) {
+    FORGE_GROUP(sdl2) {
         FORGE_PKG("sdl2");
         FORGE_ON_WINDOWS {
             FORGE_INC("vendor/sdl2/include");
@@ -44,8 +44,17 @@ FORGE_MAIN {
         FORGE_USE(hello);
         FORGE_ARGV(forge_exe("hello"), "-o", "build/generated.h");
     }
+
+    FORGE_GROUP(all) {
+        FORGE_USE(hello);
+        FORGE_USE(gen);
+    }
+
+    FORGE_DEFAULT(all);
 }
 ```
+
+`FORGE_DEFAULT` takes up to 8 names per call; call it again for more. An empty default group (no `FORGE_USE`) prints a warning and builds nothing.
 
 ```
 cc -o build build.c
