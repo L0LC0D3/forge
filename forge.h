@@ -66,6 +66,7 @@ enum {
     FORGE_KIND_EXE,
     FORGE_KIND_LIB,
     FORGE_KIND_DLL,
+    FORGE_KIND_CMD,
     FORGE_KIND_IMPORT
 };
 
@@ -156,7 +157,12 @@ typedef struct ForgeTarget {
     ForgeStrs cflags_msvc;
     ForgeStrs cflags_clang;
     ForgeStrs pkg;
+    ForgeStrs outs;
+    ForgeStrs argv;
 } ForgeTarget;
+
+const char *forge_path(const char *name);
+const char *forge_exe(const char *name);
 
 void forge__rebuild(int argc, char **argv, const char *src, ...);
 void forge__init(void);
@@ -184,6 +190,8 @@ void forge__set_jobs(int n);
     for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_DLL, #name); forge__t; forge__t = forge__end(forge__t))
 #define FORGE_IMPORT(name) \
     for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_IMPORT, #name); forge__t; forge__t = forge__end(forge__t))
+#define FORGE_CMD(name) \
+    for (ForgeTarget *forge__t = forge__begin(FORGE_KIND_CMD, #name); forge__t; forge__t = forge__end(forge__t))
 
 #define FORGE_SRC(...)         forge__add_src(&forge__cur()->srcs, __VA_ARGS__, NULL)
 #define FORGE_INC(...)         forge__add(&forge__cur()->incs, __VA_ARGS__, NULL)
@@ -195,6 +203,8 @@ void forge__set_jobs(int n);
 #define FORGE_CFLAGS_MSVC(...) forge__add(&forge__cur()->cflags_msvc, __VA_ARGS__, NULL)
 #define FORGE_CFLAGS_CLANG(...) forge__add(&forge__cur()->cflags_clang, __VA_ARGS__, NULL)
 #define FORGE_USE(name)        forge__add(&forge__cur()->uses, #name, NULL)
+#define FORGE_OUT(...)         forge__add(&forge__cur()->outs, __VA_ARGS__, NULL)
+#define FORGE_ARGV(...)        forge__add(&forge__cur()->argv, __VA_ARGS__, NULL)
 #define FORGE_PKG(pkg)         forge__pkg(pkg)
 #define FORGE_OUTDIR(p)        (forge__cur()->outdir = (p))
 #define FORGE_STD(x)           (forge__cur()->std = #x)
@@ -502,6 +512,8 @@ ForgeTarget *forge__begin(int kind, const char *name)
     forge__strs_copy(&t->cflags_msvc, &forge__def.cflags_msvc);
     forge__strs_copy(&t->cflags_clang, &forge__def.cflags_clang);
     forge__strs_copy(&t->pkg, &forge__def.pkg);
+    forge__strs_copy(&t->outs, &forge__def.outs);
+    forge__strs_copy(&t->argv, &forge__def.argv);
     forge__now = t;
     return t;
 }
@@ -704,6 +716,31 @@ static int forge__mkdirs(const char *path)
         return 0;
     }
     free(buf);
+    return 1;
+}
+
+static int forge__mkdir_out(const char *path)
+{
+    char *p = forge__dup(path);
+    char *s;
+    if (!p[0]) {
+        free(p);
+        return 1;
+    }
+    for (s = p + strlen(p); s > p; ) {
+        --s;
+        if (*s == '/' || *s == '\\') {
+            if (s == p)
+                break;
+            *s = '\0';
+            if (!forge__mkdirs(p)) {
+                free(p);
+                return 0;
+            }
+            break;
+        }
+    }
+    free(p);
     return 1;
 }
 
@@ -1973,6 +2010,10 @@ static ForgeTarget *forge__find(const char *name)
 static const char *forge__out(ForgeTarget *t)
 {
     switch (t->kind) {
+    case FORGE_KIND_CMD:
+        if (t->outs.count < 1)
+            return NULL;
+        return t->outs.items[0];
     case FORGE_KIND_EXE:
         return forge__fmt("%s/%s%s", t->outdir, t->name, forge__exeext());
     case FORGE_KIND_LIB:
@@ -1994,8 +2035,56 @@ static const char *forge__out(ForgeTarget *t)
 
 static const char *forge__linkfile(ForgeTarget *t)
 {
+    if (t->kind == FORGE_KIND_CMD) {
+        if (t->outs.count < 1)
+            return NULL;
+        return t->outs.items[0];
+    }
     if (t->kind == FORGE_KIND_DLL && forge__msvc())
         return forge__fmt("%s/%s.lib", t->outdir, t->name);
+    return forge__out(t);
+}
+
+const char *forge_path(const char *name)
+{
+    ForgeTarget *t = forge__find(name);
+    if (!t) {
+        forge__errf("unknown target `%s`", name);
+        forge__err = 1;
+        return "";
+    }
+    if (t->kind == FORGE_KIND_CMD) {
+        if (t->outs.count < 1) {
+            forge__errf("target `%s` has no outs", name);
+            forge__err = 1;
+            return "";
+        }
+        return t->outs.items[0];
+    }
+    {
+        const char *o = forge__out(t);
+        if (!o) {
+            forge__errf("target `%s` has no output", name);
+            forge__err = 1;
+            return "";
+        }
+        return o;
+    }
+}
+
+const char *forge_exe(const char *name)
+{
+    ForgeTarget *t = forge__find(name);
+    if (!t) {
+        forge__errf("unknown target `%s`", name);
+        forge__err = 1;
+        return "";
+    }
+    if (t->kind != FORGE_KIND_EXE && t->kind != FORGE_KIND_DLL) {
+        forge__errf("target `%s` is not an executable", name);
+        forge__err = 1;
+        return "";
+    }
     return forge__out(t);
 }
 
@@ -2065,7 +2154,11 @@ static void forge__gather(ForgeTarget *t, ForgeTarget *acc, ForgeStrs *arts, For
         forge__add1(seen, u->name);
         forge__gather(u, acc, arts, seen);
         forge__merge(acc, u);
-        if (u->kind == FORGE_KIND_LIB || u->kind == FORGE_KIND_DLL)
+        if (u->kind == FORGE_KIND_CMD) {
+            int j;
+            for (j = 0; j < u->outs.count; j++)
+                forge__add1(arts, u->outs.items[j]);
+        } else if (u->kind == FORGE_KIND_LIB || u->kind == FORGE_KIND_DLL)
             forge__add1(arts, forge__linkfile(u));
     }
 }
@@ -2165,7 +2258,8 @@ static void forge__emit_lib(ForgeStrs *cmd, const char *lib)
 enum {
     FORGE_J_CC,
     FORGE_J_AR,
-    FORGE_J_LD
+    FORGE_J_LD,
+    FORGE_J_CMD
 };
 
 typedef struct ForgeJob {
@@ -2301,7 +2395,17 @@ static int forge__start_job(ForgeJob *j, ForgeSlot *s, int ji)
 {
     ForgeStrs cmd = {0};
     const char *tag, *path;
-    if (j->kind == FORGE_J_CC) {
+    if (j->kind == FORGE_J_CMD) {
+        int i;
+        for (i = 0; i < j->t->argv.count; i++)
+            forge__add1(&cmd, j->t->argv.items[i]);
+        for (i = 0; i < j->t->outs.count; i++) {
+            if (!forge__mkdir_out(j->t->outs.items[i]))
+                return 0;
+        }
+        tag = "CMD";
+        path = j->t->name;
+    } else if (j->kind == FORGE_J_CC) {
         forge__cmd_cc(j, &cmd);
         tag = j->cxx ? "CXX" : "CC";
         path = j->src;
@@ -2321,6 +2425,71 @@ static int forge__start_job(ForgeJob *j, ForgeSlot *s, int ji)
     s->tname = j->t->name;
     s->job = ji;
     forge__strs_copy(&s->cmd, &cmd);
+    return 1;
+}
+
+static int forge__is_out(const ForgeStrs *outs, const char *p)
+{
+    int i;
+    for (i = 0; i < outs->count; i++)
+        if (strcmp(outs->items[i], p) == 0)
+            return 1;
+    return 0;
+}
+
+static void forge__use_products(ForgeTarget *u, ForgeStrs *products)
+{
+    int j;
+    if (u->kind == FORGE_KIND_EXE || u->kind == FORGE_KIND_LIB || u->kind == FORGE_KIND_DLL) {
+        const char *p = forge__linkfile(u);
+        if (p)
+            forge__add1(products, p);
+    } else if (u->kind == FORGE_KIND_CMD) {
+        for (j = 0; j < u->outs.count; j++)
+            forge__add1(products, u->outs.items[j]);
+    }
+}
+
+static void forge__use_inputs(ForgeTarget *t, ForgeStrs *inputs)
+{
+    int i;
+    for (i = 0; i < t->uses.count; i++) {
+        ForgeTarget *u = forge__find(t->uses.items[i]);
+        if (!u)
+            continue;
+        forge__use_products(u, inputs);
+    }
+}
+
+static void forge__cmd_inputs(ForgeTarget *t, ForgeStrs *inputs)
+{
+    int i;
+    forge__use_inputs(t, inputs);
+    for (i = 0; i < t->argv.count; i++) {
+        const char *a = t->argv.items[i];
+        if (a[0] == '-')
+            continue;
+        if (forge__is_out(&t->outs, a))
+            continue;
+        if (forge__isfile(a) && !forge__has(inputs, a))
+            forge__add1(inputs, a);
+    }
+}
+
+static int forge__cmd_uptodate(ForgeTarget *t, const ForgeStrs *inputs)
+{
+    int i, j;
+    time_t ot, it;
+    for (i = 0; i < t->outs.count; i++) {
+        if (!forge__mtime(t->outs.items[i], &ot))
+            return 0;
+        for (j = 0; j < inputs->count; j++) {
+            if (!forge__mtime(inputs->items[j], &it))
+                return 0;
+            if (it > ot)
+                return 0;
+        }
+    }
     return 1;
 }
 
@@ -2358,6 +2527,28 @@ static int forge__collect_target(ForgeTarget *t, ForgeJob **jobs, int *nj, int *
 
     if (t->kind == FORGE_KIND_IMPORT)
         return 1;
+    if (t->kind == FORGE_KIND_CMD) {
+        ForgeStrs cmdin = {0};
+        ForgeJob j;
+        ti = (int)(t - forge__targets);
+        if (t->outs.count < 1) {
+            forge__errf("target `%s` has no outs", t->name);
+            return 0;
+        }
+        if (t->argv.count < 1) {
+            forge__errf("target `%s` has no argv", t->name);
+            return 0;
+        }
+        forge__cmd_inputs(t, &cmdin);
+        if (forge__cmd_uptodate(t, &cmdin))
+            return 1;
+        memset(&j, 0, sizeof(j));
+        j.kind = FORGE_J_CMD;
+        j.t = t;
+        link = forge__job_add(jobs, nj, cap, &j);
+        link_of[ti] = link;
+        return 1;
+    }
     if (t->srcs.count < 1) {
         forge__errf("target `%s` has no sources", t->name);
         return 0;
@@ -2618,9 +2809,17 @@ static int forge__clean(void)
         for (j = 0; j < forge__ntargets; j++) {
             ForgeTarget *t = &forge__targets[j];
             const char *out, *lf;
+            int k;
             if (t->kind == FORGE_KIND_IMPORT || !t->outdir ||
                     strcmp(t->outdir, d) != 0)
                 continue;
+            if (t->kind == FORGE_KIND_CMD) {
+                for (k = 0; k < t->outs.count; k++) {
+                    if (!forge__rm_rf(t->outs.items[k]))
+                        return 0;
+                }
+                continue;
+            }
             out = forge__out(t);
             if (out && !forge__rm_rf(out))
                 return 0;
@@ -2644,9 +2843,17 @@ static void forge__clear_color(void)
 static int forge__clean_one(ForgeTarget *t)
 {
     const char *out, *lf;
+    int i;
     if (t->kind == FORGE_KIND_IMPORT)
         return 1;
     forge__say("CLEAN", t->name);
+    if (t->kind == FORGE_KIND_CMD) {
+        for (i = 0; i < t->outs.count; i++) {
+            if (!forge__rm_rf(t->outs.items[i]))
+                return 0;
+        }
+        return 1;
+    }
     out = forge__out(t);
     if (out && !forge__rm_rf(out))
         return 0;

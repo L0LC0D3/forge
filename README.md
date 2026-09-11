@@ -38,6 +38,12 @@ FORGE_MAIN {
         FORGE_CFLAGS_GNU("-fno-strict-aliasing");
         FORGE_CFLAGS_MSVC("/utf-8");
     }
+
+    FORGE_CMD(gen) {
+        FORGE_OUT("build/generated.h");
+        FORGE_USE(hello);
+        FORGE_ARGV(forge_exe("hello"), "-o", "build/generated.h");
+    }
 }
 ```
 
