@@ -124,6 +124,11 @@ FORGE_INLINE int forge_dialect(void)
     return FORGE_DIALECT_GNU;
 }
 
+FORGE_INLINE const char *forge_header_path(void)
+{
+    return __FILE__;
+}
+
 typedef struct ForgeStrs {
     const char **items;
     int count;
@@ -208,7 +213,7 @@ void forge__set_jobs(int n);
 #define FORGE_MAIN \
     static void forge__recipe(int argc FORGE__UNUSED, char **argv FORGE__UNUSED); \
     int main(int argc, char **argv) { \
-        forge__rebuild(argc, argv, __FILE__, NULL); \
+        forge__rebuild(argc, argv, __FILE__, forge_header_path(), NULL); \
         forge__init(); \
         forge__recipe(argc, argv); \
         return forge__run(argc, argv) ? 0 : 1; \
@@ -2947,6 +2952,14 @@ void forge__rebuild(int argc, char **argv, const char *src, ...)
     while ((extra = va_arg(ap, const char *)) != NULL)
         forge__add1(&srcs, extra);
     va_end(ap);
+
+    for (i = 0; i < srcs.count; i++) {
+        time_t t;
+        if (!forge__mtime(srcs.items[i], &t)) {
+            forge__errf("cannot stat `%s`", srcs.items[i]);
+            exit(1);
+        }
+    }
 
     need = forge__needs(bin, srcs.items, srcs.count);
     if (need < 0)
