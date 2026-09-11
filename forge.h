@@ -2944,6 +2944,7 @@ static void forge__help(const char *argv0)
     printf("Usage: %s [option]... [target]...\n", forge__base(argv0));
     printf("  --rebuild   delete outputs and rebuild\n");
     printf("  --clean     delete outputs\n");
+    printf("  --run       build then run an executable\n");
     printf("  --verbose   print compiler commands\n");
     printf("  -j, --jobs N  parallel jobs (default: nproc)\n");
     printf("  -h, --help  show this help\n");
@@ -2988,24 +2989,129 @@ static int forge__parse_jobs(const char *s, int *out)
     return 1;
 }
 
-static int forge__args(int argc, char **argv, int *rebuild, int *clean, ForgeStrs *want)
+typedef struct {
+    int rebuild;
+    int clean;
+    int run;
+    ForgeStrs want;
+    ForgeStrs run_argv;
+} ForgeCli;
+
+static ForgeTarget *forge__default_exe(void)
 {
-    int i, rest = 0;
-    *rebuild = 0;
-    *clean = 0;
+    int i;
+    for (i = 0; i < forge__ntargets; i++) {
+        if (forge__targets[i].kind == FORGE_KIND_EXE)
+            return &forge__targets[i];
+    }
+    return NULL;
+}
+
+static ForgeTarget *forge__run_target(ForgeStrs *want)
+{
+    ForgeTarget *t;
+    if (want->count > 1) {
+        forge__errf("--run accepts at most one target");
+        return NULL;
+    }
+    if (want->count == 1) {
+        t = forge__find(want->items[0]);
+        if (!t) {
+            forge__errf("unknown target `%s`", want->items[0]);
+            return NULL;
+        }
+        if (t->kind != FORGE_KIND_EXE) {
+            forge__errf("target `%s` is not an executable", t->name);
+            return NULL;
+        }
+        return t;
+    }
+    t = forge__default_exe();
+    if (!t) {
+        forge__errf("no executable target to run");
+        return NULL;
+    }
+    return t;
+}
+
+static int forge__run_cmd(ForgeStrs *cmd)
+{
+    ForgeSlot s;
+    int code = 127;
+#ifdef _WIN32
+    DWORD ec = 1;
+#else
+    int st = 0;
+#endif
+    if (cmd->count < 1)
+        return 127;
+    if (!forge__spawn(cmd, &s, 0))
+        return 127;
+#ifdef _WIN32
+    WaitForSingleObject(s.proc, INFINITE);
+    GetExitCodeProcess(s.proc, &ec);
+    CloseHandle(s.proc);
+    CloseHandle(s.th);
+    s.proc = NULL;
+    s.th = NULL;
+    code = (int)ec;
+#else
+    if (waitpid(s.pid, &st, 0) >= 0) {
+        if (WIFEXITED(st))
+            code = WEXITSTATUS(st);
+        else if (WIFSIGNALED(st))
+            code = 128 + WTERMSIG(st);
+    }
+    s.pid = 0;
+#endif
+    s.used = 0;
+    return code;
+}
+
+static int forge__run_exe(ForgeTarget *t, ForgeStrs *run_argv)
+{
+    ForgeStrs cmd = {0};
+    const char *exe;
+    int i;
+    exe = forge__out(t);
+    if (!exe)
+        return 127;
+    forge__add1(&cmd, exe);
+    for (i = 0; i < run_argv->count; i++)
+        forge__add1(&cmd, run_argv->items[i]);
+    forge__say("RUN", exe);
+    if (forge__verbose)
+        forge__printcmd(&cmd);
+    return forge__run_cmd(&cmd);
+}
+
+static int forge__args(int argc, char **argv, ForgeCli *cli)
+{
+    int i, rest = 0, run_rest = 0;
+    cli->rebuild = 0;
+    cli->clean = 0;
+    cli->run = 0;
+    cli->want.count = 0;
+    cli->run_argv.count = 0;
     forge__verbose = 0;
     forge__jobs_cli = 0;
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!rest && strcmp(a, "--") == 0) {
+        if (cli->run && !run_rest && strcmp(a, "--") == 0) {
+            run_rest = 1;
+            continue;
+        }
+        if (!rest && !run_rest && strcmp(a, "--") == 0) {
             rest = 1;
             continue;
         }
-        if (!rest && a[0] == '-' && a[1]) {
+        if (!rest && !run_rest && a[0] == '-' && a[1]) {
             if (strcmp(a, "--rebuild") == 0)
-                *rebuild = 1;
+                cli->rebuild = 1;
             else if (strcmp(a, "--clean") == 0)
-                *clean = 1;
+                cli->clean = 1;
+            else if (strcmp(a, "--run") == 0)
+                cli->run = 1;
             else if (strcmp(a, "--verbose") == 0)
                 forge__verbose = 1;
             else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -3032,7 +3138,10 @@ static int forge__args(int argc, char **argv, int *rebuild, int *clean, ForgeStr
             }
             continue;
         }
-        forge__add1(want, a);
+        if (run_rest)
+            forge__add1(&cli->run_argv, a);
+        else
+            forge__add1(&cli->want, a);
     }
     return 1;
 }
@@ -3061,17 +3170,27 @@ static void forge__warn_empty_defaults(void)
 
 int forge__run(int argc, char **argv)
 {
+    ForgeCli cli = {0};
     ForgeStrs want = {0};
+    ForgeTarget *run_t = NULL;
     ForgeJob *jobs = NULL;
-    int i, tot = 0, ok = 1, rebuild = 0, clean = 0, args, nj = 0;
+    int i, tot = 0, ok = 1, args, nj = 0;
     if (forge__err)
         return 0;
-    args = forge__args(argc, argv, &rebuild, &clean, &want);
+    args = forge__args(argc, argv, &cli);
     if (args < 0)
         return 0;
     if (args == 0)
         return 1;
-    if (want.count == 0 && forge__defaults.count > 0) {
+    if (cli.run) {
+        run_t = forge__run_target(&cli.want);
+        if (!run_t)
+            return 0;
+        if (cli.want.count < 1)
+            forge__add1(&cli.want, run_t->name);
+    }
+    want = cli.want;
+    if (!cli.run && want.count == 0 && forge__defaults.count > 0) {
         for (i = 0; i < forge__defaults.count; i++)
             forge__add1(&want, forge__defaults.items[i]);
         forge__warn_empty_defaults();
@@ -3079,7 +3198,7 @@ int forge__run(int argc, char **argv)
     forge__resolve_jobs();
     if (want.count > 0 && !forge__resolve(&want))
         return 0;
-    if (clean || rebuild) {
+    if (cli.clean || cli.rebuild) {
         if (want.count < 1) {
             if (!forge__clean())
                 return 0;
@@ -3091,7 +3210,7 @@ int forge__run(int argc, char **argv)
             forge__clear_color();
         }
     }
-    if (clean && !rebuild)
+    if (cli.clean && !cli.rebuild)
         return 1;
     if (!forge__collect_jobs(&want, &jobs, &nj))
         return 0;
@@ -3099,7 +3218,11 @@ int forge__run(int argc, char **argv)
     forge__bar_begin(tot);
     ok = forge__sched(jobs, nj);
     forge__bar_off();
-    return ok;
+    if (!ok)
+        return 0;
+    if (cli.run)
+        exit(forge__run_exe(run_t, &cli.run_argv));
+    return 1;
 }
 
 static int forge__ends_iexe(const char *s)
