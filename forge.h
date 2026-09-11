@@ -158,6 +158,10 @@ typedef struct ForgeTarget {
     ForgeStrs cflags_gnu;
     ForgeStrs cflags_msvc;
     ForgeStrs cflags_clang;
+    ForgeStrs lflags;
+    ForgeStrs lflags_gnu;
+    ForgeStrs lflags_msvc;
+    ForgeStrs lflags_clang;
     ForgeStrs pkg;
     ForgeStrs outs;
     ForgeStrs argv;
@@ -224,6 +228,10 @@ void forge__set_jobs(int n);
 #define FORGE_CFLAGS_GNU(...)  forge__add(&forge__cur()->cflags_gnu, __VA_ARGS__, NULL)
 #define FORGE_CFLAGS_MSVC(...) forge__add(&forge__cur()->cflags_msvc, __VA_ARGS__, NULL)
 #define FORGE_CFLAGS_CLANG(...) forge__add(&forge__cur()->cflags_clang, __VA_ARGS__, NULL)
+#define FORGE_LDFLAGS(...)      forge__add(&forge__cur()->lflags, __VA_ARGS__, NULL)
+#define FORGE_LDFLAGS_GNU(...)  forge__add(&forge__cur()->lflags_gnu, __VA_ARGS__, NULL)
+#define FORGE_LDFLAGS_MSVC(...) forge__add(&forge__cur()->lflags_msvc, __VA_ARGS__, NULL)
+#define FORGE_LDFLAGS_CLANG(...) forge__add(&forge__cur()->lflags_clang, __VA_ARGS__, NULL)
 #define FORGE_USE(name)        forge__add(&forge__cur()->uses, #name, NULL)
 #define FORGE_OUT(...)         forge__add(&forge__cur()->outs, __VA_ARGS__, NULL)
 #define FORGE_ARGV(...)        forge__add(&forge__cur()->argv, __VA_ARGS__, NULL)
@@ -535,6 +543,10 @@ ForgeTarget *forge__begin(int kind, const char *name)
     forge__strs_copy(&t->cflags_gnu, &forge__def.cflags_gnu);
     forge__strs_copy(&t->cflags_msvc, &forge__def.cflags_msvc);
     forge__strs_copy(&t->cflags_clang, &forge__def.cflags_clang);
+    forge__strs_copy(&t->lflags, &forge__def.lflags);
+    forge__strs_copy(&t->lflags_gnu, &forge__def.lflags_gnu);
+    forge__strs_copy(&t->lflags_msvc, &forge__def.lflags_msvc);
+    forge__strs_copy(&t->lflags_clang, &forge__def.lflags_clang);
     forge__strs_copy(&t->pkg, &forge__def.pkg);
     forge__strs_copy(&t->outs, &forge__def.outs);
     forge__strs_copy(&t->argv, &forge__def.argv);
@@ -2195,6 +2207,10 @@ static void forge__merge(ForgeTarget *acc, ForgeTarget *u)
     forge__strs_cat(&acc->cflags_gnu, &u->cflags_gnu);
     forge__strs_cat(&acc->cflags_msvc, &u->cflags_msvc);
     forge__strs_cat(&acc->cflags_clang, &u->cflags_clang);
+    forge__strs_cat(&acc->lflags, &u->lflags);
+    forge__strs_cat(&acc->lflags_gnu, &u->lflags_gnu);
+    forge__strs_cat(&acc->lflags_msvc, &u->lflags_msvc);
+    forge__strs_cat(&acc->lflags_clang, &u->lflags_clang);
     forge__strs_cat(&acc->pkg, &u->pkg);
 }
 
@@ -2243,6 +2259,22 @@ static void forge__emit_cflags(ForgeStrs *cmd, ForgeTarget *t)
     if (cc == FORGE_CC_CLANG || cc == FORGE_CC_CLANGCL)
         for (i = 0; i < t->cflags_clang.count; i++)
             forge__add1(cmd, t->cflags_clang.items[i]);
+}
+
+static void forge__emit_lflags(ForgeStrs *cmd, ForgeTarget *t)
+{
+    int i, cc = forge_cc();
+    for (i = 0; i < t->lflags.count; i++)
+        forge__add1(cmd, t->lflags.items[i]);
+    if (!forge__msvc())
+        for (i = 0; i < t->lflags_gnu.count; i++)
+            forge__add1(cmd, t->lflags_gnu.items[i]);
+    if (forge__msvc())
+        for (i = 0; i < t->lflags_msvc.count; i++)
+            forge__add1(cmd, t->lflags_msvc.items[i]);
+    if (cc == FORGE_CC_CLANG || cc == FORGE_CC_CLANGCL)
+        for (i = 0; i < t->lflags_clang.count; i++)
+            forge__add1(cmd, t->lflags_clang.items[i]);
 }
 
 static void forge__emit_compile(ForgeStrs *cmd, ForgeTarget *t)
@@ -2437,6 +2469,7 @@ static void forge__cmd_link(ForgeJob *j, ForgeStrs *cmd)
         forge__add1(cmd, forge__fmt(forge__msvc() ? "/LIBPATH:%s" : "-L%s", acc.libdirs.items[i]));
     for (i = 0; i < acc.libs.count; i++)
         forge__emit_lib(cmd, acc.libs.items[i]);
+    forge__emit_lflags(cmd, &acc);
     for (i = 0; i < acc.pkg.count; i++) {
         const char *s = acc.pkg.items[i];
         if (forge__isincdef(s))
